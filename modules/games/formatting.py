@@ -1,0 +1,230 @@
+"""纯渲染函数：资讯列表、卡池、兑换码、动态、空态。
+
+零 astrbot 依赖、零状态，所有展示口径集中在这里，方便对着真数据逐字校对
+（电费插件在 v1.0.7/v1.0.8/v1.1.0 三次真跑渲染中各抓到一个只有真跑才看得见的
+列表方向 bug——渲染口径必须能被单测钉住）。
+"""
+
+import time
+
+try:
+    from .codes import expiry_note
+    from .providers import game_display
+    from .providers.base import strip_html
+except ImportError:  # 兜底：被以非包方式加载时
+    from codes import expiry_note  # type: ignore
+    from providers import game_display  # type: ignore
+    from providers.base import strip_html  # type: ignore
+
+# 兑换码为空时的固定文案。用户决策：不提供手动登记，必须让「没有」看起来
+# 像一个明确答案而不是故障。
+EMPTY_CODE_TEXT = "没有兑换码QWQ"
+EMPTY_NEWS_TEXT = "暂时没有查到相关资讯，稍后再试试。"
+EMPTY_DYNAMIC_TEXT = "该官方号暂时没有可读取的动态。"
+
+# B站对未登录请求会把纯图片动态的文字正文裁掉（实测 major.opus 返回 null）。
+# 这条文案要同时回答"为什么空"和"怎么办"，别只留白让人以为插件坏了。
+CONTENT_MISSING_TEXT = (
+    "（B站没把这条动态的文字内容返回给未登录请求，点链接看原帖；"
+    "在插件详情页扫码登录后通常就能取到）"
+)
+
+CATEGORY_ICON = {"公告": "📢", "活动": "🎉", "新闻": "📰", "资讯": "📄"}
+
+
+def fmt_date(ts: float, with_time: bool = True) -> str:
+    """Unix 秒 → "MM-DD" 或 "MM-DD HH:MM"。ts 异常时不炸。"""
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    tm = time.localtime(value)
+    if with_time:
+        return time.strftime("%m-%d %H:%M", tm)
+    return time.strftime("%m-%d", tm)
+
+
+def fmt_ago(ts: float, now: float | None = None) -> str:
+    """相对时间，用于「3 小时前」。超过一周直接给日期。"""
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    now = now if now is not None else time.time()
+    delta = now - value
+    if delta < 0:
+        return fmt_date(value)
+    if delta < 3600:
+        return f"{int(delta // 60)} 分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)} 小时前"
+    if delta < 7 * 86400:
+        return f"{int(delta // 86400)} 天前"
+    return fmt_date(value, with_time=False)
+
+
+def one_line(text: str, limit: int = 80) -> str:
+    """压成单行摘要（HTML 已在 provider 层剥过，这里只处理换行与超长）。"""
+    flat = " ".join(str(text or "").split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return flat
+
+
+def news_lines(items, with_summary: bool = True) -> list[str]:
+    """资讯列表渲染。每行：分类图标 + 标题 + 日期 + 链接。"""
+    lines = []
+    for item in items:
+        icon = CATEGORY_ICON.get(item.category, "📄")
+        head = f"{icon} [{item.category}] {one_line(item.title, 40)}"
+        meta = [p for p in (fmt_date(item.published), item.url) if p]
+        lines.append(head)
+        if with_summary and item.summary:
+            lines.append(f"    {one_line(item.summary, 80)}")
+        lines.append("    " + " | ".join(meta))
+    return lines
+
+
+def news_text(items, header: str, with_summary: bool = True) -> str:
+    body = news_lines(items, with_summary=with_summary)
+    if not body:
+        return f"{header}\n{EMPTY_NEWS_TEXT}"
+    return "\n".join([header, ""] + body)
+
+
+def gacha_lines(items, time_ranges: dict[str, list[str]]) -> list[str]:
+    """卡池视图：命中卡池词条的公告 + 抽出的活动时间段。
+
+    time_ranges 按 item_id 索引，抽不到时间段时不硬凑——宁可少一行也不要给错时间。
+    """
+    lines = []
+    for item in items:
+        icon = CATEGORY_ICON.get(item.category, "📄")
+        lines.append(f"{icon} {one_line(item.title, 44)}")
+        for rng in time_ranges.get(item.item_id) or []:
+            lines.append(f"    🕒 {rng}")
+        if item.summary:
+            lines.append(f"    {one_line(item.summary, 80)}")
+        meta = [p for p in (fmt_date(item.published), item.url) if p]
+        lines.append("    " + " | ".join(meta))
+    return lines
+
+
+def code_lines(records, ttl_hours: int = 24) -> list[str]:
+    lines = []
+    for rec in records:
+        lines.append(f"🎁 {rec.get('code')}")
+        note = expiry_note(rec, ttl_hours)
+        source = "、".join(rec.get("sources") or [rec.get("source") or ""])
+        tail = [p for p in (note, f"来源：{source}" if source else "") if p]
+        lines.append("    " + " | ".join(tail))
+        if rec.get("url"):
+            lines.append(f"    {rec['url']}")
+    return lines
+
+
+def codes_text(records, game_label: str, ttl_hours: int = 24) -> str:
+    header = f"🎁 {game_label} 兑换码"
+    if not records:
+        return f"{header}\n{EMPTY_CODE_TEXT}"
+    return "\n".join([header, ""] + code_lines(records, ttl_hours))
+
+
+def dynamic_lines(items) -> list[str]:
+    lines = []
+    for item in items:
+        title = one_line(item.title, 40) if item.title else ""
+        head = f"📣 [{item.kind}] {title}" if title else f"📣 [{item.kind}]"
+        lines.append(head)
+        body = one_line(item.text, 100)
+        # 标题和正文都空 = B站对未登录请求裁掉了图文正文（实测 major.opus 直接返回 null）。
+        # 说清楚"为什么没有"比留白强，顺带告诉用户登录能解决。
+        if body:
+            lines.append(f"    {body}")
+        elif not title:
+            lines.append(f"    {CONTENT_MISSING_TEXT}")
+        meta = [p for p in (fmt_ago(item.published), item.url) if p]
+        lines.append("    " + " | ".join(meta))
+    return lines
+
+
+def dynamics_text(items, game_label: str) -> str:
+    header = f"📣 {game_label} B站官方动态"
+    if not items:
+        return f"{header}\n{EMPTY_DYNAMIC_TEXT}"
+    return "\n".join([header, ""] + dynamic_lines(items))
+
+
+def push_text(items) -> str:
+    """轮询发现新条目时的推送文案（比查询态紧凑，推送量比查询量大）。"""
+    lines = []
+    for item in items:
+        icon = CATEGORY_ICON.get(item.category, "📄")
+        lines.append(f"{icon} {one_line(item.title, 44)}")
+        meta = [p for p in (fmt_date(item.published), item.url) if p]
+        lines.append("    " + " | ".join(meta))
+    return "\n".join(lines)
+
+
+def summary_of(item, limit: int = 80) -> str:
+    """给 AI 工具用的摘要：标题 + 纯文本摘要 + 链接。"""
+    parts = [one_line(item.title, 60)]
+    body = strip_html(item.content or item.summary, limit=limit)
+    if body:
+        parts.append(one_line(body, limit))
+    parts.append(item.url)
+    return "\n".join(parts)
+
+
+def help_text(enabled, poll_min: int, dynamics_min: int, push_on: bool) -> str:
+    """帮助文案。轮询频率等读配置显示，免得写了默认值和实际不符。"""
+    game_line = (
+        "、".join(game_display(k) for k in enabled) if enabled else "（未启用任何数据源）"
+    )
+    push_line = "已开启" if push_on else "未开启（用 /游戏 订阅 开启本会话推送）"
+    return "\n".join(
+        [
+            "🎮 游戏资讯监控",
+            "",
+            f"· 数据源：{game_line}",
+            f"· 资讯轮询：{poll_min} 分钟｜动态轮询：{dynamics_min} 分钟",
+            f"· 群订阅推送：{push_line}",
+            "",
+            "指令：",
+            "  /游戏            两游戏最新资讯各 5 条",
+            "  /游戏 <游戏名>   指定游戏最新资讯",
+            "  /游戏 <游戏名> 卡池   卡池公告 + 活动时间",
+            "  /游戏 <游戏名> 兑换   兑换码（别名：码/兑换码）",
+            "  /游戏 <游戏名> 版本   版本更新与维护公告",
+            "  /游戏 订阅 <游戏|全部|关闭>   开关本会话推送（群内仅管理员）",
+            "  /游戏 帮助       本说明",
+            "",
+            "游戏名可以写：重返未来/1999/九九/重返、明日方舟/方舟/ak。",
+            "也可以直接问我：「1999 最近有什么卡池」「方舟兑换码」。",
+        ]
+    )
+
+
+def subscribe_text(action: str, detail: str) -> str:
+    return f"🔔 {action}\n{detail}"
+
+
+def scope_text(subs) -> str:
+    """订阅状态视图。"""
+    if not subs:
+        return "本会话未订阅任何推送。\n发送 /游戏 订阅 全部 开启，或 /游戏 订阅 <游戏名> 单独订阅。"
+    games = "、".join(game_display(g) for g in subs.get("games") or []) or "（无）"
+    dyn = "开" if subs.get("dynamics") else "关"
+    return "\n".join(
+        [
+            "🔔 本会话订阅状态",
+            f"· 游戏：{games}",
+            f"· B站动态推送：{dyn}",
+            "",
+            "发送 /游戏 订阅 关闭 可取消。",
+        ]
+    )
