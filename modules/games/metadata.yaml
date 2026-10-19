@@ -2,6 +2,6 @@ name: astrbot_plugin_games_monitor
 display_name: 游戏资讯监控
 desc: 重返未来：1999 / 明日方舟 官方资讯聚合：最新公告活动新闻、卡池时间、版本更新预告、B站官方动态与兑换码自动提取；支持指令查询、AI 对话查询、群订阅推送、WebUI 扫码登录 B站。
 short_desc: 1999 与方舟官方资讯、卡池、兑换码聚合，支持群订阅推送。
-version: v1.0.0
+version: v1.1.0
 author: Cecilian
 repo: https://github.com/Cecilian-Elysian/astrbot_plugin_games_monitor

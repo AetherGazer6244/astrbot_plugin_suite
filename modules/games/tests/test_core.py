@@ -404,12 +404,36 @@ def test_codes_text_renders_code_source_and_expiry():
     assert "小时后失效" in text
 
 
-def test_news_text_contains_category_date_and_link():
+def test_news_text_contains_category_and_date():
     item = _item(title="4.0 版本更新维护公告", category="公告", url="https://x/1")
     text = F.news_text([item], "🎮 测试")
     assert "📢" in text
     assert "4.0 版本更新维护公告" in text
-    assert "https://x/1" in text
+    assert F.fmt_date(item.published) in text
+
+
+def test_chat_renderers_never_carry_urls():
+    """用户决策：对话输出一律不给链接，有效信息由 AI 摘要提取。
+
+    URL 只保留给内部链路（summary_of → 喂给模型）。
+    """
+    item = _item(title="维护公告", url="https://x/1", summary="s")
+    assert "https://" not in F.news_text([item], "H")
+    assert "https://" not in F.push_text([item])
+    assert "https://" not in F.gacha_lines([item], {}).__str__()
+    rec = {"code": "AAAA1111", "sources": ["bilibili"], "url": "https://u", "expire_at": 0}
+    assert "https://" not in F.codes_text([rec], "重返未来：1999")
+
+    class Dyn:
+        game = "re1999"
+        item_id = "1"
+        title = "PV"
+        text = "正文"
+        published = time.time()
+        url = "https://t.bilibili.com/1"
+        kind = "视频"
+
+    assert "https://" not in F.dynamics_text([Dyn()], "重返未来：1999")
 
 
 def test_news_text_empty_state():
@@ -439,7 +463,7 @@ def test_dynamics_text_empty_state_for_silent_official_account():
     assert F.EMPTY_DYNAMIC_TEXT in F.dynamics_text([], "明日方舟")
 
 
-def test_dynamics_text_renders_kind_title_and_link():
+def test_dynamics_text_renders_kind_and_title():
     class Dyn:
         game = "re1999"
         item_id = "1"
@@ -452,7 +476,17 @@ def test_dynamics_text_renders_kind_title_and_link():
     text = F.dynamics_text([Dyn()], "重返未来：1999")
     assert "[视频]" in text
     assert "新版本 PV" in text
-    assert "https://t.bilibili.com/1" in text
+    assert "10 分钟前" in text
+
+
+def test_dynamics_text_skips_stripped_items():
+    """未登录请求会把纯图片动态的文字裁掉（major.opus=null）——空壳不渲染。"""
+    from astrbot_plugin_games_monitor.providers.bilibili import DynamicItem
+
+    full = DynamicItem("re1999", "1", "PV", "正文", time.time(), "u", "视频")
+    stripped = DynamicItem("re1999", "2", "", "", time.time(), "u", "图文")
+    text = F.dynamics_text([full, stripped], "重返未来：1999")
+    assert text.count("PV") == 1  # 只渲染了有内容的那条
 
 
 def test_summary_of_strips_html_for_llm():

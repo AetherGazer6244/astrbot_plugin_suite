@@ -83,5 +83,17 @@
     "type": "bool",
     "default": true,
     "hint": "仅在用户消息/近几轮上下文命中游戏关键词时才注入，不命中不花 token。"
+  },
+  "ai_summary_enabled": {
+    "description": "启用 AI 要点摘要（后台预生成）",
+    "type": "bool",
+    "default": true,
+    "hint": "后台每轮资讯轮询发现公告变化就调对话模型预生成要点摘要，/游戏 直接读缓存秒回；推送也用摘要。关闭后 /游戏 退回原始公告列表。摘要使用宿主默认配置档当前选中的对话模型。"
+  },
+  "ai_summary_max_items": {
+    "description": "AI 摘要单次使用的公告条数上限",
+    "type": "int",
+    "default": 8,
+    "hint": "每个游戏取最新 N 条公告喂给模型（3~20）。调大信息更全但 token 更贵。"
   }
 }

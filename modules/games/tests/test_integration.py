@@ -38,11 +38,16 @@ def _news(item_id, title, game="re1999", ts=None, summary="", content="", catego
 
 
 def _plugin(tmp_path, config=None, items=None, error=None, dyns=None, ctx=None, store=None):
+    # 两个游戏各一份假源：v1.1.0 起轮询不再按订阅裁剪，共享实例会让
+    # 「退避期内不重试」这类按游戏计数的断言互相污染
     src = FakeSource(items, error)
+    src2 = FakeSource(items, error)
+    cfg = {"ai_summary_enabled": False}  # 摘要测试专归 test_summary.py，这里默认关掉
+    cfg.update(config or {})
     plugin = make_plugin(
-        config=config or {},
+        config=cfg,
         store=store if store is not None else Store(tmp_path / "s.json"),
-        sources={"re1999": src, "arknights": src},
+        sources={"re1999": src, "arknights": src2},
         bili=FakeBili(dyns),
         context=ctx or FakeContext(),
     )
@@ -83,6 +88,11 @@ def _run_cmd(plugin, event):
         ("订阅 全部", "订阅", "全部"),
         ("订阅 关闭", "订阅", "关闭"),
         ("订阅 1999", "订阅", "1999"),
+        ("总结", "总结", ""),
+        ("总结 1999", "总结", "1999"),
+        ("摘要", "总结", ""),
+        ("方舟 列表", "列表", "方舟"),
+        ("列表", "列表", ""),
         ("版本更新", "版本", ""),
         ("方舟版本", "版本", "方舟"),
         ("  1999   卡池  ", "卡池", "1999"),

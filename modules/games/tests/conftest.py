@@ -42,6 +42,8 @@ def make_plugin(config=None, store=None, sources=None, bili=None, context=None, 
     plugin.scheduler = scheduler
     plugin._tasks = []
     plugin._events = []
+    plugin._digest_cache = {}
+    plugin._digest_tasks = {}
     plugin._failure_backoff = {}
     return plugin
 
@@ -85,15 +87,50 @@ class FakeEvent:
 
 
 class FakeContext:
-    """记录所有推送给 (session, text)，ok=False 可模拟发送失败。"""
+    """记录所有推送给 (session, text)，ok=False 可模拟发送失败。
 
-    def __init__(self, ok=True):
+    provider 非空时通过 get_using_provider 暴露，供 AI 摘要路径使用。
+    """
+
+    def __init__(self, ok=True, provider=None):
         self.ok = ok
+        self.provider = provider
         self.sent: list[tuple[str, str]] = []
 
     async def send_message(self, session, chain):
         self.sent.append((session, chain.get_plain_text()))
         return self.ok
+
+    def get_using_provider(self, umo=None):
+        return self.provider
+
+
+class FakeProvider:
+    """宿主对话模型替身：text_chat(prompt=...) → completion_text。
+
+    text 是「模型要回的摘要」；error 非空模拟 LLM 故障；delay 模拟慢模型（秒）。
+    calls 记录每次收到的 prompt，供断言「喂给模型的里有没有 URL」与调用次数。
+    """
+
+    def __init__(self, text="- 要点一\n- 要点二", error=None, delay=0.0):
+        self.text = text
+        self.error = error
+        self.delay = delay
+        self.calls: list[str] = []
+
+    async def text_chat(self, prompt=None, **kwargs):
+        import asyncio as _asyncio
+
+        self.calls.append(str(prompt or ""))
+        if self.delay:
+            await _asyncio.sleep(self.delay)
+        if isinstance(self.error, Exception):
+            raise self.error
+
+        class _Resp:
+            completion_text = self.text
+
+        return _Resp()
 
 
 class FakeSource:

@@ -1,7 +1,8 @@
 ﻿"""游戏资讯监控插件（重返未来：1999 / 明日方舟）。
 
-- /游戏 一条裸指令内部分发：最新资讯 / 卡池 / 兑换码 / 版本 / 订阅 / 帮助
-- 定时轮询两家官网 → 新公告、新兑换码按会话订阅推送
+- /游戏 一条裸指令内部分发：AI 要点摘要 / 原始列表 / 卡池 / 兑换码 / 版本 / 订阅 / 帮助
+- 定时轮询两家官网：公告变化时后台调 LLM 预生成要点摘要，/游戏 读缓存秒回；
+  新兑换码按会话订阅推送
 - B站官方动态轮询（兑换码的第二个来源），扫码登录可在 WebUI 页面完成
 - 3 个 LLM 工具 + on_llm_request 幕后提示钩子，聊到游戏话题自动查真数据
 - 数据源：ak.hypergryph.com（方舟）、re.bluepoch.com（1999）、api.bilibili.com（动态）
@@ -63,6 +64,13 @@ try:
         resolve_uids,
     )
     from .storage import Store
+    from .summarizer import (
+        DIGEST_WAIT_SECONDS,
+        PUSH_DIGEST_WAIT_SECONDS,
+        build_digest_prompt,
+        cache_key,
+        summarize,
+    )
 except ImportError:  # 兜底：被以非包方式加载时
     import webui  # type: ignore
     from codes import merge_into, scan_dynamics, scan_item  # type: ignore
@@ -101,6 +109,13 @@ except ImportError:  # 兜底：被以非包方式加载时
         resolve_uids,
     )
     from storage import Store  # type: ignore
+    from summarizer import (  # type: ignore
+        DIGEST_WAIT_SECONDS,
+        PUSH_DIGEST_WAIT_SECONDS,
+        build_digest_prompt,
+        cache_key,
+        summarize,
+    )
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -170,8 +185,8 @@ def _llm_request_hook():
     PLUGIN_NAME,
     "Cecilian",
     "游戏资讯监控：重返未来：1999 与明日方舟官方公告/卡池/版本/兑换码聚合，"
-    "支持指令查询、AI 对话查询、群订阅推送与 WebUI 扫码登录 B站",
-    "1.0.0",
+    "AI 后台生成要点摘要、对话查询、群订阅推送与 WebUI 扫码登录 B站",
+    "1.1.0",
 )
 class GamesMonitorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -183,6 +198,11 @@ class GamesMonitorPlugin(Star):
         self.scheduler: AsyncIOScheduler | None = None
         self._tasks: list[asyncio.Task] = []
         self._events: list[str] = []
+        # AI 摘要缓存：游戏 key → (公告 id 元组, 摘要文本)。内存态，重启清空，
+        # 下一轮轮询（≤10 分钟）就会重新预热。
+        self._digest_cache: dict[str, tuple[tuple, str]] = {}
+        # 每个游戏最多一个在途生成任务：查询/推送/轮询三方共用，绝不双调 LLM
+        self._digest_tasks: dict[str, asyncio.Task] = {}
         # 数据源名 → {"fail": 连续失败次数, "until": 退避截止时间戳}
         self._failure_backoff: dict[str, dict] = {}
         # 最近一次生成二维码的时间，用于本地判过期（省一趟必然失败的请求）
@@ -200,41 +220,58 @@ class GamesMonitorPlugin(Star):
         self._build_sources()
 
         self.scheduler = AsyncIOScheduler()
-        if self._cfg_bool("push_enabled", False):
-            news_min = self._poll_minutes("poll_interval_minutes", 10, 5, 120)
-            self.scheduler.add_job(
-                self._poll_news,
-                IntervalTrigger(minutes=news_min),
-                id="poll_news",
-                max_instances=1,
-                coalesce=True,
-            )
-            dyn_min = self._poll_minutes("dynamics_poll_minutes", 15, 5, 120)
-            self.scheduler.add_job(
-                self._poll_dynamics,
-                IntervalTrigger(minutes=dyn_min),
-                id="poll_dynamics",
-                max_instances=1,
-                coalesce=True,
-            )
-            self.scheduler.start()
-            logger.info(
-                f"[{PLUGIN_NAME}] 已初始化，资讯轮询={news_min}min 动态轮询={dyn_min}min"
-            )
-        else:
-            logger.info(f"[{PLUGIN_NAME}] 已初始化，推送总开关关闭（仅指令/AI 查询）")
+        # 轮询无条件启动：资讯轮询除了推送，还承担 AI 摘要后台预生成与兑换码
+        # 入库（公告正文+B站动态都是码源）——关推送的用户查询也要用。
+        # 推送资格在发送端按订阅逐会话判断，这里不再按 push_enabled 裁剪任务。
+        news_min = self._poll_minutes("poll_interval_minutes", 10, 5, 120)
+        self.scheduler.add_job(
+            self._poll_news,
+            IntervalTrigger(minutes=news_min),
+            id="poll_news",
+            max_instances=1,
+            coalesce=True,
+        )
+        dyn_min = self._poll_minutes("dynamics_poll_minutes", 15, 5, 120)
+        self.scheduler.add_job(
+            self._poll_dynamics,
+            IntervalTrigger(minutes=dyn_min),
+            id="poll_dynamics",
+            max_instances=1,
+            coalesce=True,
+        )
+        self.scheduler.start()
+        push_line = (
+            f"推送开（资讯={news_min}min 动态={dyn_min}min）"
+            if self._cfg_bool("push_enabled", False)
+            else "推送关（轮询照跑：AI 摘要预热 + 兑换码入库）"
+        )
+        logger.info(f"[{PLUGIN_NAME}] 已初始化，{push_line}")
+        # 开机预热：不等第一个轮询周期，立刻拉一次资讯把摘要缓存填上，
+        # 用户重启后马上发 /游戏 也能秒出要点。
+        self._spawn(self._poll_news())
         webui.register(self)
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """后台任务统一入口：进 _tasks 名册，terminate 时统一取消。"""
+        task = asyncio.create_task(coro)
+        self._tasks.append(task)
+        return task
 
     async def terminate(self):
         # 顺序：先停调度再取消任务，最后关连接——反过来会让运行中的轮询在
         # close 的 await 间隙重建一个再没人关的新 client（电费插件踩过）。
         if self.scheduler:
             self.scheduler.shutdown(wait=False)
+        # 在途摘要任务先取消，避免 gather _tasks 之后还有 LLM 回调写缓存
+        for t in self._digest_tasks.values():
+            t.cancel()
+        self._digest_tasks.clear()
         for t in self._tasks:
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._digest_cache.clear()
         for source in list(self.sources.values()):
             try:
                 await source.close()
@@ -356,6 +393,103 @@ class GamesMonitorPlugin(Star):
         self._note_success(name)
         return result
 
+    # ================= AI 要点摘要（后台预生成，前台秒取） =================
+    # 架构（用户拍板）：AI 在后台实时分析——轮询发现公告变化就调 LLM 写缓存，
+    # 前台 /游戏 与推送只读缓存。生成失败不缓存，下一轮自动重试。
+
+    def _digest_enabled(self) -> bool:
+        return self._cfg_bool("ai_summary_enabled", True)
+
+    def _digest_max_items(self) -> int:
+        return max(3, min(20, self._cfg_int("ai_summary_max_items", 8)))
+
+    def _digest_provider(self):
+        """后台生成统一用宿主默认配置档当前选中的对话模型。
+
+        后台任务没有会话上下文，会话级偏好模型在这里不适用；
+        想换摘要模型 = 在 WebUI 默认配置档里切换模型。
+        """
+        getter = getattr(self.context, "get_using_provider", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(None)
+        except Exception as e:
+            logger.warning(f"[{PLUGIN_NAME}] 取对话模型失败：{e!r}")
+            return None
+
+    def _digest_of(self, key: str, items: list) -> str | None:
+        """读缓存：id 元组完全一致才算命中，公告列表变了就当没有。
+
+        ⚠️ 排序必须在这里做（而不是指望调用方排过）：轮询传进来的 items 是
+        数据源原始顺序，视图/推送传的是时间倒序——真跑渲染抓到过两边 key
+        不一致导致缓存永远 miss、LLM 被重复调用一倍的 bug。
+        """
+        entry = self._digest_cache.get(key)
+        if not entry:
+            return None
+        picked = sorted(items, key=lambda i: i.published, reverse=True)
+        picked = picked[: self._digest_max_items()]
+        return entry[1] if entry[0] == cache_key(picked) else None
+
+    def _spawn_digest(self, key: str, items: list) -> None:
+        """后台生成。每游戏同时最多一个在途任务，重复触发直接复用。"""
+        existing = self._digest_tasks.get(key)
+        if existing and not existing.done():
+            return
+        self._digest_tasks[key] = asyncio.create_task(self._generate_digest(key, items))
+
+    def _maybe_refresh_digest(self, key: str, items: list) -> None:
+        """轮询钩子：缓存过期（公告变化/首启/上次失败）就 spawn 后台生成，绝不阻塞轮询。"""
+        if not self._digest_enabled() or not items:
+            return
+        if self._digest_of(key, items) is not None:
+            return
+        self._spawn_digest(key, items)
+
+    async def _generate_digest(self, key: str, items: list) -> None:
+        picked = sorted(items, key=lambda i: i.published, reverse=True)
+        picked = picked[: self._digest_max_items()]
+        provider = self._digest_provider()
+        if provider is None:
+            logger.info(f"[{PLUGIN_NAME}] AI 摘要跳过：没有可用的对话模型")
+            return
+        prompt = build_digest_prompt(game_display(key), picked)
+        try:
+            digest = await summarize(provider, prompt)
+        except Exception as e:
+            # 失败不缓存 → 下一轮轮询自动重试；前台/推送各自兜底
+            logger.warning(f"[{PLUGIN_NAME}] {game_display(key)} AI 摘要生成失败：{e!r}")
+            return
+        self._digest_cache[key] = (cache_key(picked), digest)
+        logger.info(f"[{PLUGIN_NAME}] {game_display(key)} AI 摘要已更新（{len(picked)} 条公告）")
+
+    async def _ensure_digest(self, key: str, items: list, wait_seconds: float) -> str | None:
+        """查询/推送路径：缓存命中直接回；没命中就在途任务上有限时等待。
+
+        等不到（超时/失败/没配模型）返回 None，调用方回退原始列表。
+        超时不取消生成任务本身（shield）——它继续在后台跑完写缓存，
+        用户「稍后再发一次 /游戏」就能拿到。
+        """
+        if not self._digest_enabled():
+            return None
+        picked = sorted(items, key=lambda i: i.published, reverse=True)
+        picked = picked[: self._digest_max_items()]
+        cached = self._digest_of(key, picked)
+        if cached is not None:
+            return cached
+        self._spawn_digest(key, picked)
+        task = self._digest_tasks.get(key)
+        if task is None:
+            return None
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+        except Exception:
+            return None
+        return self._digest_of(key, picked)
+
     # ================= 指令 =================
 
     @filter.command("游戏", alias={"games", "游戏资讯"})
@@ -367,6 +501,14 @@ class GamesMonitorPlugin(Star):
             return
         if sub == "订阅":
             yield event.plain_result(await self._handle_subscribe(event, rest))
+            return
+        if sub == "总结":
+            # 显式要摘要——与默认视图同路（默认就是 AI 摘要），留给肌肉记忆
+            yield event.plain_result(await self._news_view(rest))
+            return
+        if sub == "列表":
+            # 逃生口：不想要 AI 摘要时看原始列表（同样不带链接）
+            yield event.plain_result(await self._news_view(rest, raw=True))
             return
         if sub == "卡池":
             yield event.plain_result(await self._gacha_view(rest))
@@ -420,22 +562,46 @@ class GamesMonitorPlugin(Star):
             return [], key  # 认得出但没启用
         return [], None
 
-    async def _news_view(self, rest: str) -> str:
+    async def _news_view(self, rest: str, raw: bool = False) -> str:
+        """默认视图 = AI 要点摘要（后台已预生成，这里只读缓存）。
+
+        raw=True 时跳过摘要直接出原始列表（/游戏 列表）。
+        摘要不可用（未开/没配模型/还在生成/生成失败）时自动退回原始列表，
+        绝不让指令挂掉或返回空。
+        """
         games, unknown = self._target_games(rest)
         if not games:
             if unknown:
                 return f"⚠️ {game_display(unknown)} 的数据源当前是关闭的，可以在插件配置里打开。"
             return UNKNOWN_GAME_HINT + "\n\n" + self._help_text()
-        limit = self._max_push()
-        blocks, errors = [], []
+        push_n = self._max_push()
+        # 取数必须覆盖摘要窗口（max_items）：轮询那边拿 15 条、这里只拿 5 条的话，
+        # 两边的 cache_key（最新 N 条 id）对不上，缓存永远 miss、LLM 被重复调用——
+        # 真跑渲染抓到的第二个 key 不一致 bug。展示仍按 push_n 截断。
+        fetch_n = max(push_n, self._digest_max_items())
+        blocks, errors, fallback = [], [], False
         for key in games:
-            items = await self._safe_call(f"news:{key}", lambda k=key: self._latest(k, limit))
+            items = await self._safe_call(f"news:{key}", lambda k=key, n=fetch_n: self._latest(k, n))
             if items is None:
                 errors.append(game_display(key))
                 continue
             items.sort(key=lambda i: i.published, reverse=True)
-            blocks.append(news_text(items[:limit], f"🎮 {game_display(key)} 最新资讯"))
-        return self._join_blocks(blocks, errors)
+            digest = None
+            if not raw:
+                digest = await self._ensure_digest(key, items, DIGEST_WAIT_SECONDS)
+            if digest:
+                blocks.append(f"🎮 {game_display(key)} 资讯要点\n\n{digest}")
+            else:
+                if not raw:
+                    fallback = True
+                blocks.append(news_text(items[:push_n], f"🎮 {game_display(key)} 最新资讯"))
+        text = self._join_blocks(blocks, errors)
+        if fallback:
+            text += (
+                "\n\nℹ️ AI 摘要还没备好（刚启动/模型不可用/正在生成），先看原始列表；"
+                "稍后再发一次 /游戏 就是要点版。"
+            )
+        return text
 
     async def _gacha_view(self, rest: str) -> str:
         games, unknown = self._target_games(rest)
@@ -633,20 +799,21 @@ class GamesMonitorPlugin(Star):
         for key in self._enabled_games():
             if not self.store:
                 break
-            if not self.store.subscribers(key):
-                continue
             limit = max(self._max_push() * 3, 15)
             items = await self._safe_call(
                 f"news:{key}", lambda k=key, n=limit: self._latest(k, n)
             )
             if not items:
                 continue
-            fresh = await self._new_items(key, items)
             # 公告正文兜底扫码要在这批条目记已读之前做：码是新信息，不能因为
-            # 推送失败而被跳过（seen 回滚只影响推送，不影响入库）
+            # 推送失败而被跳过（seen 回滚只影响推送，不影响入库）。
+            # ⚠️ 没有订阅者也要扫——/游戏 兑换 的公告码源全靠这里，与推送无关。
             await self._broadcast_codes(key, await self._absorb_codes(key, items))
-            if fresh:
-                await self._push_news(key, fresh)
+            # 后台摘要预生成：spawn 后立即继续，绝不阻塞轮询周期
+            self._maybe_refresh_digest(key, items)
+            fresh = await self._new_items(key, items)
+            if fresh and self.store.subscribers(key):
+                await self._push_news(key, fresh, items)
 
     async def _poll_dynamics(self) -> None:
         if not (self.store and self.bili):
@@ -715,17 +882,27 @@ class GamesMonitorPlugin(Star):
         fresh = [d for d in dyns if d.item_id not in seen]
         return sorted(fresh, key=lambda d: d.published, reverse=True)
 
-    async def _push_news(self, key: str, fresh: list) -> None:
+    async def _push_news(self, key: str, fresh: list, items: list | None = None) -> None:
         """把新条目推给订阅了该游戏的每个会话，全部送达后才记已读。
 
         ⚠️ 发送失败就整批不记账（电费插件的教训）。宁可下一轮给已收到的人重发一次，
         也不能让没收到的人永远收不到——漏推比重复糟糕得多。
+
+        推送正文优先用 AI 摘要（用户拍板：推送也总结）。摘要基于**全量最新列表**
+        而不是 fresh 切片——新公告本来就在最前面，且与查询缓存共用同一份，
+        不会为推送单独多调一次 LLM。等不到摘要就退原始列表（已去链接）。
         """
         if not self.store:
             return
         source = f"news:{key}"
         batch = fresh[: self._max_push()]
-        body = f"🆕 {game_display(key)} 有新公告\n\n{push_text(batch)}"
+        digest = None
+        if items:
+            digest = await self._ensure_digest(key, items, PUSH_DIGEST_WAIT_SECONDS)
+        if digest:
+            body = f"🆕 {game_display(key)} 资讯要点\n\n{digest}"
+        else:
+            body = f"🆕 {game_display(key)} 有新公告\n\n{push_text(batch)}"
         all_ok = True
         for umo, _sub in self.store.subscribers(key):
             if self.store.is_muted(umo):

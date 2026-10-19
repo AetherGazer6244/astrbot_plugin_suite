@@ -230,6 +230,8 @@ def pick(items, keywords: tuple[str, ...], limit: int = 5):
 # ⚠️ 别名一律先经 fold() 归一再比对，因此 "Help"/"HELP"/"帮助 " 都能命中。
 SUB_COMMANDS: dict[str, tuple[str, ...]] = {
     "帮助": ("帮助", "help", "菜单", "?", "？"),
+    "总结": ("总结", "摘要", "要点", "summary", "digest"),
+    "列表": ("列表", "原始", "详情", "list", "raw"),
     "卡池": ("卡池", "卡", "gacha", "up池", "up"),
     "兑换": ("兑换", "兑换码", "码", "code", "cdk"),
     "版本": ("版本", "更新", "维护", "version"),

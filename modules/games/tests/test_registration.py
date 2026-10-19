@@ -15,8 +15,8 @@ from astrbot_plugin_games_monitor import main
 
 _PLUGIN_CLS = main.GamesMonitorPlugin
 
-# 用户可见的 6 条行为（计划书第二节）
-EXPECTED_BEHAVIOURS = ("帮助", "最新资讯", "卡池", "兑换码", "版本", "订阅")
+# 用户可见的 7 条行为（v1.1.0：默认视图改为 AI 要点，原始列表降为 /游戏 列表）
+EXPECTED_BEHAVIOURS = ("帮助", "资讯要点", "列表", "卡池", "兑换码", "版本", "订阅")
 
 
 def _members():

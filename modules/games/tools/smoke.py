@@ -24,6 +24,7 @@ from astrbot_plugin_games_monitor.storage import Store
 from conftest import (
     FakeContext,
     FakeEvent,
+    FakeProvider,
     StubAstrBotConfig,
     make_plugin,
 )
@@ -41,6 +42,9 @@ ROUTES = [
     ("游戏", "帮助"),
     ("游戏", "1999"),
     ("游戏", "方舟"),
+    ("游戏", "总结"),      # v1.1.0：显式摘要路由（与默认视图同路）
+    ("游戏", "1999", "总结"),
+    ("游戏", "列表"),      # v1.1.0：逃生口，永远原始列表
     ("游戏", "1999", "卡池"),
     ("游戏", "方舟", "卡池"),
     ("游戏", "方舟", "版本"),
@@ -58,7 +62,13 @@ async def run_one(plugin, args):
 
 
 async def main(only=None):
-    plugin = make_plugin(config=StubAstrBotConfig({"user_agent": UA}), context=FakeContext())
+    # 真跑不连真模型：摘要链路（轮询→后台生成→缓存→前台秒取→推送摘要）
+    # 用假 provider 打通，验证的是渲染与调度，不是模型质量。
+    provider = FakeProvider(text="- 【假模型要点】第一条\n- 【假模型要点】第二条")
+    plugin = make_plugin(
+        config=StubAstrBotConfig({"user_agent": UA}),
+        context=FakeContext(provider=provider),
+    )
     # 真跑不该污染真实存储：用临时文件接住订阅与码库，跑完删掉
     plugin.store = Store(PLUGIN_DIR / ".smoke.json")
     plugin._build_sources()
@@ -98,7 +108,15 @@ async def main(only=None):
             print("→ " + " ".join(args))
             print("=" * 72)
             print(await run_one(plugin, args))
+
+        print("\n" + "=" * 72)
+        print(f"→ 摘要缓存状态：{ {k: len(v[1]) for k, v in plugin._digest_cache.items()} }")
+        print(f"→ 假模型共被调用 {len(provider.calls)} 次")
+        print("=" * 72)
     finally:
+        # 等在途摘要任务收尾，避免 asyncio.run 关 loop 时挂着一堆 pending 警告
+        if plugin._digest_tasks:
+            await asyncio.gather(*plugin._digest_tasks.values(), return_exceptions=True)
         (PLUGIN_DIR / ".smoke.json").unlink(missing_ok=True)
         for src in list(plugin.sources.values()):
             await src.close()

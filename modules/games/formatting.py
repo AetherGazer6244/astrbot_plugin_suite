@@ -16,18 +16,12 @@ except ImportError:  # 兜底：被以非包方式加载时
     from providers import game_display  # type: ignore
     from providers.base import strip_html  # type: ignore
 
-# 兑换码为空时的固定文案。用户决策：不提供手动登记，必须让「没有」看起来
-# 像一个明确答案而不是故障。
+# 用户决策（v1.1.0）：聊天输出不放裸网址——AI 摘要负责提炼有效信息，
+# 原始列表只留分类/标题/时间。AI 工具喂给模型的内容（summary_of）保留链接，
+# 那是内部链路，用户问「给我链接」时模型仍能给。
 EMPTY_CODE_TEXT = "没有兑换码QWQ"
 EMPTY_NEWS_TEXT = "暂时没有查到相关资讯，稍后再试试。"
 EMPTY_DYNAMIC_TEXT = "该官方号暂时没有可读取的动态。"
-
-# B站对未登录请求会把纯图片动态的文字正文裁掉（实测 major.opus 返回 null）。
-# 这条文案要同时回答"为什么空"和"怎么办"，别只留白让人以为插件坏了。
-CONTENT_MISSING_TEXT = (
-    "（B站没把这条动态的文字内容返回给未登录请求，点链接看原帖；"
-    "在插件详情页扫码登录后通常就能取到）"
-)
 
 CATEGORY_ICON = {"公告": "📢", "活动": "🎉", "新闻": "📰", "资讯": "📄"}
 
@@ -76,16 +70,17 @@ def one_line(text: str, limit: int = 80) -> str:
 
 
 def news_lines(items, with_summary: bool = True) -> list[str]:
-    """资讯列表渲染。每行：分类图标 + 标题 + 日期 + 链接。"""
+    """资讯列表渲染。每行：分类图标 + 标题 + 日期（不含链接，用户决策）。"""
     lines = []
     for item in items:
         icon = CATEGORY_ICON.get(item.category, "📄")
         head = f"{icon} [{item.category}] {one_line(item.title, 40)}"
-        meta = [p for p in (fmt_date(item.published), item.url) if p]
+        date = fmt_date(item.published)
         lines.append(head)
         if with_summary and item.summary:
             lines.append(f"    {one_line(item.summary, 80)}")
-        lines.append("    " + " | ".join(meta))
+        if date:
+            lines.append(f"    {date}")
     return lines
 
 
@@ -109,8 +104,9 @@ def gacha_lines(items, time_ranges: dict[str, list[str]]) -> list[str]:
             lines.append(f"    🕒 {rng}")
         if item.summary:
             lines.append(f"    {one_line(item.summary, 80)}")
-        meta = [p for p in (fmt_date(item.published), item.url) if p]
-        lines.append("    " + " | ".join(meta))
+        date = fmt_date(item.published)
+        if date:
+            lines.append(f"    {date}")
     return lines
 
 
@@ -122,8 +118,6 @@ def code_lines(records, ttl_hours: int = 24) -> list[str]:
         source = "、".join(rec.get("sources") or [rec.get("source") or ""])
         tail = [p for p in (note, f"来源：{source}" if source else "") if p]
         lines.append("    " + " | ".join(tail))
-        if rec.get("url"):
-            lines.append(f"    {rec['url']}")
     return lines
 
 
@@ -135,20 +129,23 @@ def codes_text(records, game_label: str, ttl_hours: int = 24) -> str:
 
 
 def dynamic_lines(items) -> list[str]:
+    """动态渲染。链接一律不放（用户决策）；没标题也没正文的条目整条跳过——
+    B站对未登录请求会把纯图片动态的文字裁掉（实测 major.opus 返回 null），
+    这种条目去掉链接后什么都剩不下，渲染出来只是空壳噪音。
+    """
     lines = []
     for item in items:
         title = one_line(item.title, 40) if item.title else ""
+        body = one_line(item.text, 100)
+        if not title and not body:
+            continue
         head = f"📣 [{item.kind}] {title}" if title else f"📣 [{item.kind}]"
         lines.append(head)
-        body = one_line(item.text, 100)
-        # 标题和正文都空 = B站对未登录请求裁掉了图文正文（实测 major.opus 直接返回 null）。
-        # 说清楚"为什么没有"比留白强，顺带告诉用户登录能解决。
         if body:
             lines.append(f"    {body}")
-        elif not title:
-            lines.append(f"    {CONTENT_MISSING_TEXT}")
-        meta = [p for p in (fmt_ago(item.published), item.url) if p]
-        lines.append("    " + " | ".join(meta))
+        ago = fmt_ago(item.published)
+        if ago:
+            lines.append(f"    {ago}")
     return lines
 
 
@@ -160,13 +157,14 @@ def dynamics_text(items, game_label: str) -> str:
 
 
 def push_text(items) -> str:
-    """轮询发现新条目时的推送文案（比查询态紧凑，推送量比查询量大）。"""
+    """轮询发现新条目时的兜底推送文案（AI 摘要不可用时才用，紧凑优先）。"""
     lines = []
     for item in items:
         icon = CATEGORY_ICON.get(item.category, "📄")
         lines.append(f"{icon} {one_line(item.title, 44)}")
-        meta = [p for p in (fmt_date(item.published), item.url) if p]
-        lines.append("    " + " | ".join(meta))
+        date = fmt_date(item.published)
+        if date:
+            lines.append(f"    {date}")
     return "\n".join(lines)
 
 
@@ -192,11 +190,13 @@ def help_text(enabled, poll_min: int, dynamics_min: int, push_on: bool) -> str:
             "",
             f"· 数据源：{game_line}",
             f"· 资讯轮询：{poll_min} 分钟｜动态轮询：{dynamics_min} 分钟",
+            "· AI 摘要：后台自动生成，/游戏 秒出资讯要点",
             f"· 群订阅推送：{push_line}",
             "",
             "指令：",
-            "  /游戏            两游戏最新资讯各 5 条",
-            "  /游戏 <游戏名>   指定游戏最新资讯",
+            "  /游戏            两游戏 AI 要点摘要",
+            "  /游戏 <游戏名>   指定游戏的 AI 摘要",
+            "  /游戏 列表        原始公告列表（不带 AI，可加游戏名）",
             "  /游戏 <游戏名> 卡池   卡池公告 + 活动时间",
             "  /游戏 <游戏名> 兑换   兑换码（别名：码/兑换码）",
             "  /游戏 <游戏名> 版本   版本更新与维护公告",
