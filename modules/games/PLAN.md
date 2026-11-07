@@ -64,8 +64,8 @@ AstrBot 插件：实时聚合《重返未来：1999》《明日方舟》官方�
 支持指令查询、AI 对话工具、群订阅推送、WebUI 扫码登录 B站。
 
 - 插件名：`astrbot_plugin_games_monitor`，主指令 `/游戏`
-- 宿主：腾讯云 `203.0.113.10` 的 AstrBot v4.27.2（与 astrbot_plugin_dorm_electric 同实例）
-- 仓库：`github.com/Cecilian-Elysian/astrbot_plugin_games_monitor`（main 分支，WebUI 从 GitHub 安装）
+- 宿主：腾讯云服务器（IP 见内部档案，不写入仓库文件）的 AstrBot（与 astrbot_plugin_dorm_electric 同实例）
+- 仓库：`github.com/AetherGazer6244/astrbot_plugin_games_monitor`（main 分支，WebUI 从 GitHub 安装）
 - 首发 v1.0.0，两游戏；架构做 provider 注册表，后续加游戏（原神/星铁/绝区零等）= 加模块
 
 ## 二、指令集（最终版，6 个）
