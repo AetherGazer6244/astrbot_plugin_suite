@@ -10,7 +10,7 @@ B站官方动态、兑换码**。支持指令查询、AI 对话查询、群订�
 
 ## 快速开始
 
-1. WebUI → 插件市场 → 从 GitHub 安装 `Cecilian-Elysian/astrbot_plugin_games_monitor`
+1. WebUI → 插件市场 → 从 GitHub 安装 `AetherGazer6244/astrbot_plugin_games_monitor`
 2. 打开插件配置，**推送总开关默认是关的**。只想查询就直接用；要收推送就打开「启用群订阅推送」，
    再在会话里发 `/游戏 订阅 全部`
 3. 直接问也行：「1999 最近有什么卡池」「方舟兑换码」
