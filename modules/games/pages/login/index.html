@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>B站扫码登录</title>
+<link rel="stylesheet" href="./style.css"/>
+<script
+  src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+  integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"
+  crossorigin="anonymous"
+  referrerpolicy="no-referrer"
+></script>
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand">🎮 游戏资讯监控</div>
+    <div class="meta" id="topbar-meta">B站登录态</div>
+  </header>
+
+  <main id="main">
+    <section class="card">
+      <h2>📱 扫码登录 B站</h2>
+      <p class="lead">
+        登录态（SESSDATA）用来拉取两个官方号的动态——直播预告、兑换码大多发在动态里。
+        <strong>登录态等于账号权限</strong>，插件不会在任何聊天或日志里回显它。
+      </p>
+      <p class="lead muted">
+        不登录也能用：公告、卡池、版本、公告正文里的兑换码都不受影响，
+        只是 B站动态这条来源可能偶尔被风控拦。不想要登录态的话，可以随时在配置里清空它。
+      </p>
+
+      <div class="qr-area">
+        <div id="qrcode"></div>
+        <div class="qr-side">
+          <p id="status" class="status">点击右侧按钮生成二维码</p>
+          <div class="actions">
+            <button id="refresh">刷新二维码</button>
+            <button id="poll" class="secondary">开始轮询</button>
+          </div>
+          <p class="hint">
+            1. 用 B站 App 扫上方二维码<br/>
+            2. 在手机上确认登录<br/>
+            3. 页面会自动变成 ✅ 已登录
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
