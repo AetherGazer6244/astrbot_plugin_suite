@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# 运行期数据（不入库）
+history.json
+store.json
+memo.json
+profiles.json
+*.corrupt-*

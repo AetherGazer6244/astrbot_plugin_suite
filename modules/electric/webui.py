@@ -12,8 +12,8 @@ import time
 
 logger = logging.getLogger("astrbot.plugin.dorm_electric")
 
-# 与 main.PLUGIN_NAME 保持一致；经 getattr 兜底，插件实例没有该属性时用常量。
-_PLUGIN_NAME = "astrbot_plugin_dorm_electric"
+# 路由前缀必须用套件插件名（页面归属 astrbot_plugin_suite，前端 apiGet 按它拼接）。
+_PLUGIN_NAME = "astrbot_plugin_suite"
 
 
 def _pname(plugin) -> str:

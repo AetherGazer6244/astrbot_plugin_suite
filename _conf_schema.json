@@ -1,0 +1,318 @@
+{
+  "modules": {
+    "type": "object",
+    "description": "模块总开关",
+    "hint": "开关对指令立即生效；轮询等后台任务在重启/重载后停止。某配置档只想启用部分模块：管理员发 /套件 档案 <档名> <模块> <开|关>。",
+    "items": {
+      "electric": {
+        "type": "bool",
+        "description": "启用宿舍电费模块",
+        "default": true
+      },
+      "games": {
+        "type": "bool",
+        "description": "启用游戏资讯模块",
+        "default": true
+      },
+      "memo": {
+        "type": "bool",
+        "description": "启用备忘录模块",
+        "default": true
+      }
+    }
+  },
+  "electric": {
+    "type": "object",
+    "description": "宿舍电费监控",
+    "items": {
+      "hjnu_base": {
+        "description": "学校缴费系统地址",
+        "type": "string",
+        "default": "http://pay2.hjnu.edu.cn",
+        "hint": "汉江师范学院默认即可，一般无需修改。"
+      },
+      "hjnu_query_path": {
+        "description": "余额查询接口路径",
+        "type": "string",
+        "default": "/wechat/basicQuery/queryElecRoomInfo.html",
+        "hint": "默认即可。"
+      },
+      "hjnu_cookie": {
+        "description": "缴费系统会话凭证（JSESSIONID）",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "obvious_hint": true,
+        "hint": "企业微信 Cookie 缓存中的会话凭证，格式如 JSESSIONID=xxxx。用仓库内 tools/extract_cookie.py 提取（无需抓包），或在 WebUI 直接粘贴。失效后发送 /电费 凭证 更新，无需重启。"
+      },
+      "hjnu_user_agent": {
+        "description": "请求 UA（需包含 wxwork 标识）",
+        "type": "string",
+        "default": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 Language/zh ColorScheme/Light wxwork/5.0.11 (MicroMessenger/6.2) WindowsWechat MailPlugin_Electron WeMail embeddisk wwmver/3.26.511.637 noMediaCs/true",
+        "hint": "服务器会校验 UA 中的 wxwork 字样，默认值即可。"
+      },
+      "hjnu_referer": {
+        "description": "请求 Referer",
+        "type": "string",
+        "default": "http://pay2.hjnu.edu.cn/wechat/elecpay/queryelec.html"
+      },
+      "fee_items": {
+        "description": "缴费项目列表（aid → 名称）",
+        "type": "dict",
+        "items": {},
+        "default": {
+          "0030000000004301": "清美时雨春雪空调（校本部）",
+          "0030000000014501": "宿舍电费（校本部）"
+        },
+        "hint": "只有 aid 的顺序有意义：第 1 项是绑定向导的主 aid（空调费），第 2 项是自动关联的宿舍电费 aid。名称仅用于日志展示，代码不读取。发送 /电费 绑定 启动向导，绑定一次宿舍会自动关联两项。"
+      },
+      "threshold_warn": {
+        "description": "低余额预警线（两费种通用默认）",
+        "type": "float",
+        "default": 10,
+        "hint": "空调费单位度、宿舍电费单位元。若下面按费种的预警线填了非零值，则该费种优先用按费种的值。"
+      },
+      "threshold_critical": {
+        "description": "紧急预警线（两费种通用默认）",
+        "type": "float",
+        "default": 5
+      },
+      "threshold_warn_ac": {
+        "description": "空调费预警线（度，0=用通用默认）",
+        "type": "float",
+        "default": 0
+      },
+      "threshold_critical_ac": {
+        "description": "空调费紧急线（度，0=取空调费预警线一半）",
+        "type": "float",
+        "default": 0
+      },
+      "threshold_warn_elec": {
+        "description": "宿舍电费预警线（元，0=用通用默认）",
+        "type": "float",
+        "default": 0
+      },
+      "threshold_critical_elec": {
+        "description": "宿舍电费紧急线（元，0=取宿舍电费预警线一半）",
+        "type": "float",
+        "default": 0
+      },
+      "alert_cooldown_hours": {
+        "description": "同级预警重复提醒间隔（小时）",
+        "type": "float",
+        "default": 24
+      },
+      "notify_recovery": {
+        "description": "余额回升到预警线以上时发送恢复通知",
+        "type": "bool",
+        "default": false
+      },
+      "poll_interval_minutes": {
+        "description": "余额轮询间隔（分钟，0 关闭轮询）",
+        "type": "int",
+        "default": 20,
+        "hint": "轮询产生历史采样与低余额预警；凭证保活由独立的「凭证保活探测间隔」负责，两者互不影响。建议 20~30 分钟，最小 5 分钟。设为 0 关闭轮询（不再产生历史与预警）。"
+      },
+      "keepalive_interval_minutes": {
+        "description": "凭证保活探测间隔（分钟，0 关闭）",
+        "type": "int",
+        "default": 8,
+        "hint": "独立于余额轮询的轻量探测（只打校区列表一个小接口），没有绑定会话也照常执行：维持凭证活跃、更早发现凭证失效并记录「凭证已存活/最近确认/最近失效」时间（仪表盘可见）。最小按 5 分钟生效；学校接口偶发抖动不会被误判为凭证失效。"
+      },
+      "daily_report": {
+        "description": "启用每日定时播报",
+        "type": "bool",
+        "default": true
+      },
+      "daily_time": {
+        "description": "每日播报时间（HH:MM）",
+        "type": "string",
+        "default": "08:00"
+      },
+      "daily_timezone": {
+        "description": "播报时区",
+        "type": "string",
+        "default": "Asia/Shanghai"
+      },
+      "request_timeout_seconds": {
+        "description": "查询请求超时（秒）",
+        "type": "int",
+        "default": 15
+      },
+      "http_proxy": {
+        "description": "查询请求使用的代理（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空为直连；也支持 http://127.0.0.1:7897 或 socks5://127.0.0.1:7897。"
+      },
+      "history_keep_days": {
+        "description": "历史数据保留天数",
+        "type": "int",
+        "default": 60
+      },
+      "ai_tools_enabled": {
+        "description": "启用 AI 对话工具",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 AI 调用电费工具会直接回「已被插件配置关闭」。群聊只读、绑定/解绑/改绑一律需私聊并在 WebUI 的「插件 → 管理行为 → 函数工具」里启用这些工具（默认即启用）。"
+      },
+      "ai_bind_code_ttl": {
+        "description": "确认验证码有效期（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "AI 发起绑定/解绑时会生成 6 位确认码，必须由用户亲手把这串数字发回来才生效；过期需重新发起。最小按 30 秒生效。"
+      },
+      "ai_prompt_hint": {
+        "description": "聊到电费时在幕后提示 AI 使用本插件工具",
+        "type": "bool",
+        "default": true,
+        "hint": "用户消息或近几轮对话命中「电费/余额/充值」等关键词时，自动在 system_prompt 末尾追加一段幕后指令，让模型优先调用电费工具、不编造余额。平时对话零额外 token 开销。"
+      },
+      "ai_lookup_cache_seconds": {
+        "description": "按房间名反查余额的结果缓存（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "群里多人重复问同一间宿舍时命中缓存，避免反复打学校接口。设为 0 关闭缓存。"
+      }
+    }
+  },
+  "games": {
+    "type": "object",
+    "description": "游戏资讯聚合",
+    "items": {
+      "push_enabled": {
+        "description": "启用群订阅推送",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭时所有定时轮照旧拉取资讯用于查询，只是不给订阅会话发消息。用 /游戏 订阅 开关单个会话。"
+      },
+      "poll_interval_minutes": {
+        "description": "资讯轮询间隔（分钟）",
+        "type": "int",
+        "default": 10,
+        "hint": "官方发布的高峰在版本更新前后，10 分钟足够；最小 5，最大 120。"
+      },
+      "dynamics_poll_minutes": {
+        "description": "B站动态轮询间隔（分钟）",
+        "type": "int",
+        "default": 15,
+        "hint": "B站风控较紧，间隔调太短容易被 -352 拦。"
+      },
+      "arknights_enabled": {
+        "description": "启用明日方舟数据源",
+        "type": "bool",
+        "default": true
+      },
+      "re1999_enabled": {
+        "description": "启用重返未来：1999 数据源",
+        "type": "bool",
+        "default": true
+      },
+      "bilibili_sessdata": {
+        "description": "B站登录态 SESSDATA",
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "obvious_hint": true,
+        "hint": "选填。不填也能读 B站公开动态，但风控较紧时可能拉取失败。推荐在插件详情页点「B站扫码登录」自动写入，或手动粘贴。等于账号登录态，插件不会在任何聊天输出里回显它。"
+      },
+      "bilibili_uids": {
+        "description": "各游戏 B站官方号 UID",
+        "type": "dict",
+        "items": {},
+        "default": {
+          "re1999": "1197454103",
+          "arknights": "161775300"
+        },
+        "hint": "UID 变更时改这里即可，不用动代码。默认值经官网外链核验。"
+      },
+      "max_items_per_push": {
+        "description": "单次推送条数上限",
+        "type": "int",
+        "default": 5
+      },
+      "code_ttl_hint_hours": {
+        "description": "兑换码默认有效期（小时）",
+        "type": "int",
+        "default": 24,
+        "hint": "官方公告里写明过期时间的以公告为准；没写的按这个小时数算到期时间提醒。"
+      },
+      "history_keep_days": {
+        "description": "已读/订阅数据保留天数",
+        "type": "int",
+        "default": 30,
+        "hint": "控制存储文件大小；不影响已推送内容的展示。"
+      },
+      "request_timeout_seconds": {
+        "description": "请求超时（秒）",
+        "type": "int",
+        "default": 15
+      },
+      "user_agent": {
+        "description": "出站请求 UA",
+        "type": "string",
+        "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "hint": "三个数据源共用。"
+      },
+      "ai_tools_enabled": {
+        "description": "启用 AI 对话工具",
+        "type": "bool",
+        "default": true
+      },
+      "ai_prompt_hint": {
+        "description": "聊到游戏话题时在幕后提示 AI 使用本插件工具",
+        "type": "bool",
+        "default": true,
+        "hint": "仅在用户消息/近几轮上下文命中游戏关键词时才注入，不命中不花 token。"
+      },
+      "ai_summary_enabled": {
+        "description": "启用 AI 要点摘要（后台预生成）",
+        "type": "bool",
+        "default": true,
+        "hint": "后台每轮资讯轮询发现公告变化就调对话模型预生成要点摘要，/游戏 直接读缓存秒回；推送也用摘要。关闭后 /游戏 退回原始公告列表。摘要使用宿主默认配置档当前选中的对话模型。"
+      },
+      "ai_summary_max_items": {
+        "description": "AI 摘要单次使用的公告条数上限",
+        "type": "int",
+        "default": 8,
+        "hint": "每个游戏取最新 N 条公告喂给模型（3~20）。调大信息更全但 token 更贵。"
+      }
+    }
+  },
+  "memo": {
+    "type": "object",
+    "description": "备忘录待办提醒",
+    "items": {
+      "memo_scan_seconds": {
+        "description": "到期提醒扫描间隔（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "每轮扫描把到点未提醒的备忘推送到原会话（30~600 秒）。推送失败会在下一轮自动重发，不会丢提醒。"
+      },
+      "memo_keep_done_days": {
+        "description": "已完成备忘保留天数",
+        "type": "int",
+        "default": 7,
+        "hint": "完成超过该天数的条目在扫描时自动清理；未完成的不清理，等用户自己收尾。"
+      },
+      "memo_max_per_session": {
+        "description": "每会话未完成备忘上限",
+        "type": "int",
+        "default": 20,
+        "hint": "防止刷屏；满员时先 /备忘 列表 整理再记。"
+      },
+      "ai_memo_tools_enabled": {
+        "description": "启用 AI 对话工具",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 AI 调用 memo_* 工具会直接回「已在插件配置里关闭」。"
+      },
+      "ai_memo_prompt_hint": {
+        "description": "聊到备忘话题时在幕后提示 AI 使用本插件工具",
+        "type": "bool",
+        "default": true,
+        "hint": "命中「备忘/待办/提醒我」等关键词才注入，不命中不花 token。"
+      }
+    }
+  }
+}

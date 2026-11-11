@@ -21,7 +21,8 @@ import time
 
 logger = logging.getLogger("astrbot.plugin.games_monitor")
 
-PLUGIN_NAME = "astrbot_plugin_games_monitor"
+# 路由前缀必须用套件插件名（页面归属 astrbot_plugin_suite，前端 apiGet 按它拼接）。
+PLUGIN_NAME = "astrbot_plugin_suite"
 BASE = f"/{PLUGIN_NAME}/login"
 
 # 二维码有效期 180 秒，超时前端会自动重新 generate
