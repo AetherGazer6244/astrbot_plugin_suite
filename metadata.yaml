@@ -2,6 +2,6 @@ name: astrbot_plugin_suite
 display_name: 功能套件（电费/游戏资讯）
 desc: 一个插件装齐三个模块：宿舍电费余额监控预警（低余额/紧急预警、每日播报、AI 对话绑定、WebUI 仪表盘）、游戏资讯聚合（1999/明日方舟公告卡池兑换码、B站动态、扫码登录）、备忘录定时提醒。模块可全局开关，也可按配置档单独启停（/套件）；旧单体插件的配置与数据首次启动自动迁移。
 short_desc: 电费监控 + 游戏资讯 + 备忘录，一个插件装齐，模块可按配置档开关。
-version: v1.1.0
+version: v1.1.1
 author: Cecilian
 repo: https://github.com/AetherGazer6244/astrbot_plugin_suite

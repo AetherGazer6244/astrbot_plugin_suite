@@ -199,6 +199,23 @@ def test_store_roundtrip(tmp_path):
     assert store2.data["next_id"] == 2
 
 
+def test_save_fsyncs_data_before_replace(tmp_path, monkeypatch):
+    """原子写之后必须 fsync（对齐套件存储红线）：os.replace 已成功但数据还在
+    页缓存的断电窗口 = 用户记的待办无声消失。"""
+    import os
+
+    calls = []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+    store = MemoStore(tmp_path / "memo.json")
+    store.add(PRIVATE_UMO, "任务")
+    store.save()  # add 只改内存，save 才落盘
+    assert calls, "save() 必须 fsync，否则断电窗口存在"
+    # 恢复真实 fsync 后重开：数据照常落盘可读
+    monkeypatch.undo()
+    store2 = MemoStore(tmp_path / "memo.json")
+    assert store2.data["items"][0]["text"] == "任务"
+
+
 def test_pending_sort_puts_unscheduled_last(tmp_path):
     store = MemoStore(tmp_path / "memo.json")
     a = store.add(PRIVATE_UMO, "不限时")
