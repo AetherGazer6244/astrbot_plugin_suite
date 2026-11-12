@@ -128,25 +128,31 @@ def _binding():
     }
 
 
-def _plugin(results, cookie="JSESSIONID=abc", events=0, binding=True):
+def _plugin(results, cookie="JSESSIONID=abc", events=0, binding=True, poll=20, keepalive=8):
     plugin = make_plugin(
-        config={"hjnu_cookie": cookie},
+        config={
+            "hjnu_cookie": cookie,
+            "poll_interval_minutes": poll,
+            "keepalive_interval_minutes": keepalive,
+        },
         store=_FakeStore(_binding() if binding else None),
         hjnu=_FakeProvider(results),
     )
     if events:
-        plugin._events = deque(
-            [
-                {
-                    "t": time.time() - 60 * (i + 1),
-                    "kind": "poll",
-                    "text": f"第 {i} 次",
-                    "umo": UMO,
-                }
-                for i in range(events)
-            ],
-            maxlen=200,
-        )
+        plugin._events = {
+            UMO: deque(
+                [
+                    {
+                        "t": time.time() - 60 * (i + 1),
+                        "kind": "poll",
+                        "text": f"第 {i} 次",
+                        "umo": UMO,
+                    }
+                    for i in range(events)
+                ],
+                maxlen=60,
+            )
+        }
     return plugin
 
 
@@ -198,12 +204,45 @@ def test_check_reports_91001_instead_of_credential_unverified():
 
 
 def test_check_reports_confirmed_expiry_when_strikes_reached():
-    """连续确认达标 → 明确说凭证失效，并给出换凭证的指引。"""
+    """连续被拒 + 时间窗已满 → 明确说凭证失效，并给出换凭证的指引。"""
     plugin = _plugin({"0030000000004301": _expired(), "0030000000014501": _expired()})
-    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
+    meta = plugin.store.data.setdefault("credential", {})
+    meta["expired_strikes"] = 2
+    meta["expired_first_at"] = time.time() - 31 * 60
     text = _call(plugin)
     assert "凭证：⚠️ 学校已拒绝（retcode 91001 会话超时）" in text
     assert "空调费：凭证已失效" in text
+
+
+def test_check_reports_suspect_before_time_window():
+    """连续被拒但时间窗未满 → 说「疑似/观察中」，不硬判失效。
+
+    学校整段发癫时用户最需要看到的是「再等等」，而不是被叫去重提凭证。
+    """
+    plugin = _plugin({"0030000000004301": _expired(), "0030000000014501": _expired()})
+    meta = plugin.store.data.setdefault("credential", {})
+    meta["expired_strikes"] = 2
+    meta["expired_first_at"] = time.time() - 60
+    text = _call(plugin)
+    assert "凭证：⏳ 学校暂时拒绝了会话（91001），正在观察中" in text
+    assert "空调费：疑似凭证失效（学校抖动观察中）" in text
+    # 观察期进度要说清楚：还需多久才判失效
+    assert "判定策略：需连续被拒满 30 分钟才判失效" in text
+    assert "已连续被拒" in text
+
+
+def test_check_reports_unconfirmed_when_probe_disabled():
+    """探测全关 → 既不判失效也不假装在观察，如实说「无法自动确认」。"""
+    plugin = _plugin(
+        {"0030000000004301": _expired(), "0030000000014501": _expired()},
+        poll=0,
+        keepalive=0,
+    )
+    text = _call(plugin)
+    assert "无法自动确认" in text
+    assert "空调费：学校拒绝了会话（未开启自动探测，无法自动确认是否失效）" in text
+    # 绝不能出现「凭证已失效」的断言
+    assert "空调费：凭证已失效" not in text
 
 
 def test_check_reports_network_failure_separately():
@@ -247,7 +286,7 @@ def test_check_records_one_event_without_duplicate_flood():
     plugin = _plugin({"0030000000004301": _ok(1.0)})
     _call(plugin)
     _call(plugin)
-    checks = [ev for ev in plugin._events if "自检" in ev["text"]]
+    checks = [ev for ev in plugin._events.get(UMO, ()) if "自检" in ev["text"]]
     assert len(checks) == 2
     assert checks[0]["text"] == "自检：✅ 有效"
     assert checks[0]["umo"] == UMO

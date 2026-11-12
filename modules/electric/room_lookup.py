@@ -249,6 +249,12 @@ class RoomResolver:
         self._credential_hint = credential_hint
 
     def _cred_hint(self) -> str:
+        """凭证提示语（由宿主持有，注入 callable）。
+
+        三种口径由宿主决定：确认失效 / 观察中（疑似抖动）/ 无法自动确认。
+        本模块不写死文案——「疑似失效」与「已失效」必须是两种说法，
+        写死在这里会让学校抖动被说成凭证过期，用户白折腾一轮重提凭证。
+        """
         if callable(self._credential_hint):
             try:
                 return self._credential_hint()

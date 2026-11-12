@@ -47,6 +47,26 @@ def test_fees_isolated():
     assert b["history_by_fee"]["elec"][0]["u"] == "元"
 
 
+def test_append_fee_history_trims_progressively_by_time():
+    """时间窗裁剪逐段推进（增量）：连续 100 天的日采样只留最近 60 天。
+
+    回归点：旧实现每次全表重建结果一致但 O(n)/次；头部推进法在正常
+    升序数据上必须给出**完全相同**的最终结果——这里锁结果，防重构漂移。
+    """
+    b = {}
+    now = time.time()
+    day = 24 * 3600
+    for i in range(100):
+        Store.append_fee_history(
+            b, "ac", float(i), "度", ts=now - (99 - i) * day, keep_days=60
+        )
+    hist = b["history_by_fee"]["ac"]
+    # 恰好卡在 60 天边界上的样本保留（t == cutoff 不删，与旧实现一致）
+    assert len(hist) == 61
+    assert hist[0]["v"] == 39.0
+    assert hist[-1]["v"] == 99.0
+
+
 def test_binding_crud(tmp_path):
     s = Store(tmp_path / "h.json")
     assert s.get_binding("u") is None

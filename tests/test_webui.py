@@ -300,18 +300,33 @@ def test_credential_state_suspect_when_confirmation_not_reached():
 
 
 def test_credential_state_expired_when_all_sessions_rejected():
-    """连续确认达标 → 确定失效。"""
+    """连续被拒 + 时间窗已满 → 确定失效。"""
     plugin = _plugin(bindings={UMO: _binding()})
     plugin._last_raw[UMO] = {
         "at": time.time(),
         "results": {"ac": _res(expired=True)},
     }
-    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
+    meta = plugin.store.data.setdefault("credential", {})
+    meta["expired_strikes"] = 2
+    meta["expired_first_at"] = time.time() - 31 * 60
     assert credential_state(plugin, {UMO: {}}) == "expired"
 
 
-def test_credential_state_expired_when_no_probe_enabled():
-    """探测全关 → 没有连续确认机制，直接判失效（不能永远挂「观察中」）。"""
+def test_credential_state_stays_suspect_before_window():
+    """计数达标但时间窗未满 → 仍是「观察中」（学校抖 8 分钟不算凭证过期）。"""
+    plugin = _plugin(bindings={UMO: _binding()})
+    plugin._last_raw[UMO] = {
+        "at": time.time(),
+        "results": {"ac": _res(expired=True)},
+    }
+    meta = plugin.store.data.setdefault("credential", {})
+    meta["expired_strikes"] = 2
+    meta["expired_first_at"] = time.time() - 60  # 才被拒 1 分钟
+    assert credential_state(plugin, {UMO: {}}) == "suspect"
+
+
+def test_credential_state_unconfirmed_when_no_probe_enabled():
+    """探测全关 → 没有确认机制，如实说「无法确认」，不硬判失效。"""
     plugin = _plugin(
         bindings={UMO: _binding()},
         poll_interval_minutes=0,
@@ -321,7 +336,7 @@ def test_credential_state_expired_when_no_probe_enabled():
         "at": time.time(),
         "results": {"ac": _res(expired=True)},
     }
-    assert credential_state(plugin, {UMO: {}}) == "expired"
+    assert credential_state(plugin, {UMO: {}}) == "unconfirmed"
 
 
 def test_credential_state_ok_when_any_balance_seen():
@@ -355,8 +370,12 @@ def test_overview_exposes_credential_state():
         "at": time.time(),
         "results": {"ac": _res(expired=True)},
     }
-    plugin.store.data.setdefault("credential", {})["expired_strikes"] = 2
+    meta = plugin.store.data.setdefault("credential", {})
+    meta["expired_strikes"] = 2
+    meta["expired_first_at"] = time.time() - 31 * 60
     resp = _call(plugin, plugin._web_overview())
     assert resp["data"]["credential_state"] == "expired"
+    # 观察期进度（时间窗）也一并暴露：仪表盘能说清「已经拒了多久」
+    assert resp["data"]["credential_observation"]["elapsed_minutes"] >= 30
     raw = json.dumps(resp, ensure_ascii=False)
     assert SECRET not in raw and "JSESSIONID" not in raw

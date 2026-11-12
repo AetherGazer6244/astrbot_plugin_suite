@@ -29,6 +29,16 @@ CREDENTIAL_SUSPECT_HINT = (
     "/电费 凭证 JSESSIONID=xxxx"
 )
 
+# 探测全关时的提示：没有自动确认机制，既不能断言「已失效」（学校抖动会
+# 误伤，用户白折腾重提一次凭证），也不能假装「还在观察」（没人推进确认）。
+# 如实说「学校拒绝了会话、无法自动确认」，把判断权交回用户。
+CREDENTIAL_UNCONFIRMED_HINT = (
+    "⚠️ 学校拒绝了本次会话（91001），但当前无法自动确认是否真的失效。\n"
+    "可能是学校服务器临时抖动（几分钟内常自愈），也可能凭证确实过期了：\n"
+    "先等 1~2 分钟重试一次；若持续失败，再重新获取 JSESSIONID 私聊发送："
+    "/电费 凭证 JSESSIONID=xxxx"
+)
+
 
 def fee_name(kind: str) -> str:
     return "空调费" if kind == "ac" else "宿舍电费"
@@ -39,7 +49,10 @@ def fee_text(kind: str, result) -> str:
 
 
 def format_fee_results(
-    results: dict[str, object], include_missing: bool = False, suspect: bool = False
+    results: dict[str, object],
+    include_missing: bool = False,
+    suspect: bool = False,
+    unconfirmed: bool = False,
 ) -> list[str]:
     """把查询结果格式化成按费种分行的文本。
 
@@ -48,6 +61,8 @@ def format_fee_results(
 
     suspect=True 时把 91001 渲染成「疑似凭证失效（学校抖动观察中）」——
     连续确认次数还没到，别把学校抖动说成凭证过期（用户白折腾一轮）。
+    unconfirmed=True 时渲染成「学校拒绝了会话（无法自动确认）」——
+    探测全关、既不能断言失效也不能假装在观察时的如实口径。
     """
     lines = []
     for kind in ("ac", "elec"):
@@ -61,7 +76,12 @@ def format_fee_results(
         if result.ok and result.value is not None:
             lines.append(fee_text(kind, result))
         elif result.session_expired:
-            if suspect:
+            if unconfirmed:
+                lines.append(
+                    f"{fee_name(kind)}：学校拒绝了会话"
+                    "（未开启自动探测，无法自动确认是否失效）"
+                )
+            elif suspect:
                 lines.append(f"{fee_name(kind)}：疑似凭证失效（学校抖动观察中）")
             else:
                 lines.append(f"{fee_name(kind)}：凭证已失效")
@@ -172,7 +192,7 @@ def history_stats(history: list[dict]) -> dict | None:
     }
 
 
-def credential_state(results: dict, suspect: bool = False) -> str:
+def credential_state(results: dict, suspect: bool = False, unconfirmed: bool = False) -> str:
     """由一次真实查询的结果判定凭证状态（供 /电费 检查 复用）。
 
     ⚠️ 与 /电费 状态 无关：那条指令显示的「凭证：已配置」只表示 hjnu_cookie
@@ -185,6 +205,8 @@ def credential_state(results: dict, suspect: bool = False) -> str:
 
     suspect=True 表示「连续确认还没到、正在观察」：此时 91001 多半是学校
     抖动，文案要给出「等一等再试」的出路，而不是催用户重新提取凭证。
+    unconfirmed=True 表示「探测全关、无法自动确认」：既不断言已失效，
+    也不假装在观察，如实说明让用户自行判断。
     """
     values = list(results.values())
     ok = [r for r in values if r is not None and r.ok and r.value is not None]
@@ -196,6 +218,11 @@ def credential_state(results: dict, suspect: bool = False) -> str:
             return "⚠️ 仅部分费种可用（详见下方明细）"
         return "✅ 有效（学校接口已接受本次查询）"
     if expired:
+        if unconfirmed:
+            return (
+                "⚠️ 学校拒绝了会话（91001），当前无法自动确认是否失效："
+                "可能是学校抖动（几分钟内自愈），也可能是凭证过期，请稍后重试"
+            )
         if suspect:
             return (
                 "⏳ 学校暂时拒绝了会话（91001），正在观察中："

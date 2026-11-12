@@ -13,6 +13,7 @@
 
 import asyncio
 import time
+from collections import deque
 
 import pytest
 from astrbot_plugin_suite.modules.electric.providers.base import BalanceResult
@@ -418,6 +419,40 @@ def test_sweep_purges_expired_confirm_tokens():
     plugin._sweep_memory()
     assert "qq:private:old" not in plugin._bind_tokens
     assert "qq:private:new" in plugin._bind_tokens  # 有效码不能被误清
+
+
+def test_sweep_clears_expired_lookup_cache_entries():
+    """反查缓存条目自身带 TTL：过期即清，新条目保留。
+
+    之前只有「200 条上限」被动淘汰，命中率永远为零的死条目一直占位。
+    """
+    store = _FakeStore({})
+    plugin = _sweep_plugin(store)
+    now = time.time()
+    plugin._lookup_cache["k-expired"] = (now - 3600, "旧文案")
+    plugin._lookup_cache["k-fresh"] = (now - 5, "新文案")
+    plugin._sweep_memory()
+    assert "k-expired" not in plugin._lookup_cache
+    assert "k-fresh" in plugin._lookup_cache
+
+
+def test_sweep_drops_stale_and_empty_event_buckets():
+    """事件流桶：无绑定 + 7 天没动静 → 整桶清；绑定会话保留；空桶顺手清。"""
+    store = _FakeStore({UMO: {"room_label": "x"}})
+    plugin = _sweep_plugin(store)
+    ancient = time.time() - 30 * 24 * 3600
+    plugin._events["qq:private:stale"] = deque(
+        [{"t": ancient, "kind": "poll", "text": "x", "umo": "qq:private:stale"}],
+        maxlen=60,
+    )
+    plugin._events[UMO] = deque(
+        [{"t": ancient, "kind": "poll", "text": "x", "umo": UMO}], maxlen=60
+    )
+    plugin._events["qq:private:empty"] = deque(maxlen=60)
+    plugin._sweep_memory()
+    assert "qq:private:stale" not in plugin._events
+    assert "qq:private:empty" not in plugin._events
+    assert UMO in plugin._events  # 绑定会话即使很久没动静也保留
 
 
 def test_last_raw_wrapper_shape_survives_log_render():

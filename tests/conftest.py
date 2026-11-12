@@ -12,7 +12,6 @@
 import logging
 import sys
 import types
-from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # astrbot_plugin_suite 的父目录
@@ -61,7 +60,7 @@ def make_plugin(config=None, store=None, hjnu=None, context=None, scheduler=None
     plugin.scheduler = scheduler
     plugin._wizard = {}
     plugin._tasks = []
-    plugin._events = deque(maxlen=200)
+    plugin._events = {}
     plugin._pending_alerts = {}
     plugin._last_raw = {}
     plugin._bind_tokens = {}

@@ -132,11 +132,25 @@ class Store:
         ts: float | None = None,
         keep_days: int = 60,
     ) -> None:
-        """保存指定费种的历史，避免度和元混在同一条曲线中。"""
+        """保存指定费种的历史，避免度和元混在同一条曲线中。
+
+        裁剪两道：数量上限（MAX_HISTORY）+ 时间窗（keep_days 天）。
+        时间裁剪用「头部推进」而不是全表重建：轮询按时间顺序追加，
+        列表天然升序，每次只需从头部清掉新越界的少数几条（摊还 O(1)）。
+        旧实现每次 `[h for h in history if ...]` 全表重建（O(n)，n 到
+        5000），每轮轮询 × 每绑定 × 每费种都来一遍，纯属浪费——
+        单绑定历史文件 354KB 时全量列表推导每 20 分钟白扫几十万条记录。
+        （乱序数据：头部推进只清前缀、可能漏清中间的老条目，但数量上限
+        仍然兜底，语义只会保守不会炸——测试里有乱序用例锁这个行为。）
+        """
         ts = ts if ts is not None else time.time()
         history = binding.setdefault("history_by_fee", {}).setdefault(fee, [])
         history.append({"t": ts, "v": value, "u": unit})
         cutoff = ts - 24 * 3600 * max(1, keep_days)
         if len(history) > MAX_HISTORY:
             del history[: len(history) - MAX_HISTORY]
-        binding["history_by_fee"][fee] = [h for h in history if h["t"] >= cutoff]
+        drop = 0
+        while drop < len(history) and history[drop]["t"] < cutoff:
+            drop += 1
+        if drop:
+            del history[:drop]

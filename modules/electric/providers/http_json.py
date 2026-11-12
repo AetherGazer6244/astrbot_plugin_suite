@@ -17,11 +17,23 @@ from .base import BalanceResult, ElecProvider, QueryError
 
 SESSION_EXPIRED_CODE = "91001"
 
-# 91001 复验延迟（秒）。学校「发癫」时会把**还活着的会话**临时判成 91001
+# 91001 复验延迟阶梯（秒）。学校「发癫」时会把**还活着的会话**临时判成 91001
 # （实录：会话即生即死、几分钟后自愈），单次 91001 就宣判凭证失效会害用户
-# 白折腾重新提取凭证——这里隔一小段把同一请求原样重发一次，复验通过就当
-# 抖动处理。秒级抖动挡在 Provider 层，分钟级抖动挡在 main 层的连续确认计数。
-EXPIRED_RECHECK_DELAY = 2.5
+# 白折腾重新提取凭证——这里隔一小段把同一请求原样重发，复验通过就当抖动处理。
+#
+# 为什么要阶梯而不是固定一次：
+#   - 固定 2.5s 一次只能挡「秒级」抖动。学校实录的抖动是「分钟级」
+#     （会话即生即死、几分钟后自愈），2.5s 复验很可能也撞在抖动窗口里，
+#     于是「复验也 91001」被当成真失效 → 白折腾一轮重新提取凭证。
+#   - 阶梯 2.5s → 8s 覆盖到 ~10s，正好压住「几分钟自愈」的绝大多数情况；
+#     再长就没必要了（真失效会在 main 层被连续确认计数 + 时间窗拦下）。
+#
+# 每次复验都换一条**全新连接**（不复用共享 client）：学校多后端节点时，
+# 同一节点可能持续返回 91001，换连接才有机会落到健康节点。
+EXPIRED_RECHECK_DELAYS: tuple[float, ...] = (2.5, 8.0)
+
+# 兼容旧调用点/旧测试：首个复验延迟。
+EXPIRED_RECHECK_DELAY = EXPIRED_RECHECK_DELAYS[0]
 
 logger = logging.getLogger("astrbot.plugin.dorm_electric")
 
@@ -138,6 +150,31 @@ class HjnuProvider(ElecProvider):
     async def _post_once(self, path: str, fields: dict) -> tuple[int, str, str]:
         """单次请求，返回 (status, text, err)；err 非空表示网络层失败。"""
         client = self._get_client()
+        return await self._post_with_client(client, path, fields)
+
+    async def _post_once_fresh(self, path: str, fields: dict) -> tuple[int, str, str]:
+        """用一条全新的一次性连接发请求（91001 复验专用）。
+
+        学校是多后端节点：同一节点可能持续返回 91001（会话状态被它判死），
+        复验若复用同一连接，很可能拿到同样的 91001 → 白复验。换一条
+        新连接 = 重新负载均衡，才有机会落到健康节点。
+
+        用完即关（不进退休池）：复验连接是一次性的，不该跟业务连接抢名额。
+        """
+        client = httpx.AsyncClient(
+            timeout=self.timeout,
+            proxy=self.proxy,
+            headers=self._headers(),
+            transport=self._transport,
+        )
+        try:
+            return await self._post_with_client(client, path, fields)
+        finally:
+            await _safe_aclose(client)
+
+    async def _post_with_client(
+        self, client: httpx.AsyncClient, path: str, fields: dict
+    ) -> tuple[int, str, str]:
         try:
             resp = await client.post(
                 self.base_url + path,
@@ -160,17 +197,29 @@ class HjnuProvider(ElecProvider):
         return resp.status_code, text, ""
 
     async def _post(self, path: str, fields: dict) -> dict:
-        """发请求、解析 JSON；91001 会隔一小段复验一次。
+        """发请求、解析 JSON；91001 会隔一小段换连接复验（阶梯）。
 
-        复验：学校发癫时会把活着的会话临时判成 91001，原样重发一次若通过，
+        复验：学校发癫时会把活着的会话临时判成 91001，原样重发若通过，
         说明只是抖动——直接当正常结果返回，不惊动用户去换凭证。
         复验仍 91001 才交给调用方按「会话失效」处理。
+
+        两处关键改动（防「学校波动造成凭证假失效」）：
+        1. 阶梯复验（EXPIRED_RECHECK_DELAYS）：单次 2.5s 复验只挡得住秒级
+           抖动；学校实录的抖动是分钟级（会话即生即死、几分钟后自愈），
+           2.5s 复验往往也撞在抖动窗口里 → 复验也 91001 → 被当成真失效，
+           害用户白折腾一轮重新提取凭证。阶梯 2.5s→8s 压住绝大多数抖动。
+        2. 每次复验换一条全新连接（不复用共享 client）：学校是多后端节点，
+           同一节点可能持续返回 91001，换连接才有机会落到健康节点。
         """
         data = await self._post_retry(path, fields)
-        if self._is_expired(data):
-            await asyncio.sleep(EXPIRED_RECHECK_DELAY)
-            logger.info("电费接口返回 91001，%.1fs 后复验一次（%s）", EXPIRED_RECHECK_DELAY, path)
-            data = await self._post_retry(path, fields)
+        for delay in EXPIRED_RECHECK_DELAYS:
+            if not self._is_expired(data):
+                break
+            await asyncio.sleep(delay)
+            logger.info(
+                "电费接口返回 91001，%.1fs 后换新连接复验（%s）", delay, path
+            )
+            data = await self._post_retry(path, fields, fresh=True)
         return data
 
     @staticmethod
@@ -180,11 +229,16 @@ class HjnuProvider(ElecProvider):
             and str(data.get("retcode", "")) == SESSION_EXPIRED_CODE
         )
 
-    async def _post_retry(self, path: str, fields: dict) -> dict:
+    async def _post_retry(self, path: str, fields: dict, fresh: bool = False) -> dict:
         # 5xx（如学校服务器偶发 502）自动换新连接重试 2 次
+        # fresh=True：91001 复验专用——每轮都用全新连接，不复用共享 client，
+        # 也不进退休池（复验连接用完即关，不该跟业务连接抢名额）。
         last_err = ""
         for attempt in range(3):
-            status, text, net_err = await self._post_once(path, fields)
+            if fresh:
+                status, text, net_err = await self._post_once_fresh(path, fields)
+            else:
+                status, text, net_err = await self._post_once(path, fields)
             if net_err:
                 last_err = net_err
                 logger.error("电费接口网络错误(%s)：%s", path, net_err)
@@ -214,7 +268,8 @@ class HjnuProvider(ElecProvider):
                 # 不在此处直接 aclose：同一实例上可能有并发请求（双费种并行查询、
                 # 房间扫描）仍握着旧 client；交给 _retire_client 攒够再关、
                 # terminate 时 close() 兜底全关。
-                await self._retire_client()
+                if not fresh:
+                    await self._retire_client()
         raise QueryError(f"{last_err}（学校服务器暂时无响应，已自动重试仍失败，请稍后再试）")
 
     @staticmethod

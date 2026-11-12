@@ -89,6 +89,7 @@ AstrBot WebUI → 插件 → 从 GitHub 安装 → 填入本仓库地址。依�
 
 - electric：`hjnu_cookie`（凭证，WebUI 或 `tools/extract_cookie.py` 更新）、
   `poll_interval_minutes`（轮询）、`keepalive_interval_minutes`（独立保活探测）、
+  `credential_confirm_min_span_minutes`（凭证失效判定时间窗，默认 30 分钟）、
   预警线（通用 + 按费种）、`ai_tools_enabled` / `ai_prompt_hint`
 - games：`push_enabled`、轮询间隔、`bilibili_sessdata`（扫码登录自动写入）、
   `ai_summary_enabled`（后台预生成 AI 要点）
@@ -119,12 +120,14 @@ system_prompt，平时零额外 token。
   `SectionConfig` 让每个 Core 只看到自己组的扁平 dict，Core 代码与旧单体完全同构。
 - **数据目录**：`data/plugin_data/astrbot_plugin_suite/{electric,games,memo}/`。
 - **提醒可靠性**：memo 扫描推送、电费预警/失联通知都是「发送成功才记账，失败
-  下轮重发」；凭证失效有防误报（91001 复验 + 连续两周期确认）。
+  下轮重发」；凭证失效有防误报（91001 阶梯复验换新连接 + 连续两周期确认 +
+  连续被拒满 30 分钟时间窗，窗内混杂 5xx/超时窗口加倍）。
 
 ## 更新日志
 
 | 版本 | 要点 |
 |---|---|
+| v1.1.0 | 电费：修「学校波动造成凭证假失效」（阶梯复验换新连接 / 连续确认 / 30 分钟时间窗 / 混杂窗口加倍，`/电费 检查` 显示判定进度，探测全关不再硬说失效）；事件流按会话隔离、反查缓存 TTL 清扫、历史采样增量裁剪；新配置 `credential_confirm_min_span_minutes` |
 | v1.0.0 | 套件诞生：合并电费（v1.3.0 基线）与游戏资讯（v1.1.0 基线）两插件为单插件三模块；新增备忘录模块（待办 + 定时提醒 + 3 个 AI 工具）；`/套件` 模块开关与配置档覆盖；旧插件配置与数据自动迁移；全历史去敏（IP/账号/密码 0 命中） |
 
 详细变更见 [CHANGELOG.md](CHANGELOG.md)。

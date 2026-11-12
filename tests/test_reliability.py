@@ -9,6 +9,7 @@
 import asyncio
 import json
 import time
+from collections import deque
 
 import httpx
 import pytest
@@ -19,7 +20,10 @@ from astrbot_plugin_suite.modules.electric.providers.http_json import (
     QueryError,
     SessionExpiredError,
 )
-from astrbot_plugin_suite.modules.electric.service import CREDENTIAL_HINT, CREDENTIAL_SUSPECT_HINT
+from astrbot_plugin_suite.modules.electric.service import (
+    CREDENTIAL_SUSPECT_HINT,
+    CREDENTIAL_UNCONFIRMED_HINT,
+)
 from conftest import make_plugin
 
 OK_BALANCE = {"retcode": "0", "errmsg": "A-8-17房间剩余电量94.66度"}
@@ -112,11 +116,11 @@ def test_network_error_retries(monkeypatch):
 
 
 def test_91001_maps_to_session_expired(monkeypatch):
-    """91001 会被复验一次；复验仍是 91001 才判失效（学校抖动别误报）。"""
+    """91001 会被阶梯复验；整条阶梯仍是 91001 才判失效（学校抖动别误报）。"""
     provider, calls = _provider([(200, json.dumps(EXPIRED))], monkeypatch)
     result = asyncio.run(provider.query_room(ROOM_PARAMS))
     assert result.session_expired and not result.ok
-    assert len(calls) == 2  # 原请求 + 复验一次
+    assert len(calls) == 1 + len(http_json.EXPIRED_RECHECK_DELAYS)
 
 
 def test_5xx_rebuild_does_not_break_concurrent_peer(monkeypatch):
@@ -163,7 +167,11 @@ def test_midscan_expiry_reports_credential_hint():
 
 
 def test_midscan_expiry_reports_confirmed_hint_without_probe():
-    """探测全关 → 没有连续确认机制，直接给确定的失效提示。"""
+    """探测全关 → 没有自动确认机制，如实说「无法确认」，不硬判失效。
+
+    学校发癫时活会话也会被临时判 91001，探测全关又没有确认机制时直接说
+    「凭证已失效」= 叫用户白折腾重提一轮凭证。
+    """
     plugin = make_plugin(
         config={
             "fee_items": {"aid": "x"},
@@ -174,7 +182,9 @@ def test_midscan_expiry_reports_confirmed_hint_without_probe():
     )
     params, err = asyncio.run(plugin._resolve_room("qq:private:1", "817"))
     assert params is None
-    assert err == CREDENTIAL_HINT
+    assert err == CREDENTIAL_UNCONFIRMED_HINT
+    # 绝不能出现「已失效」的断言
+    assert "凭证已失效" not in err
 
 
 # ================= 预警合并发送：成功才记账 =================
@@ -219,7 +229,7 @@ def test_flush_alerts_merges_two_fees_into_one_message(monkeypatch):
     assert umo == "qq:private:1"
     assert "🚨" in text and "空调费" in text and "宿舍电费" in text
     assert not plugin._pending_alerts
-    assert any(e["kind"] == "alert" for e in plugin._events)
+    assert any(e["kind"] == "alert" for e in plugin._events.get("qq:private:1", ()))
 
 
 def test_flush_alerts_send_failure_keeps_pending(monkeypatch):
@@ -233,7 +243,9 @@ def test_flush_alerts_send_failure_keeps_pending(monkeypatch):
     monkeypatch.setattr(plugin, "_send", fake_send)
     asyncio.run(plugin._flush_alerts())
     assert plugin._pending_alerts["qq:private:1"]
-    assert not any(e["kind"] == "alert" for e in plugin._events)
+    assert not any(
+        e["kind"] == "alert" for e in plugin._events.get("qq:private:1", ())
+    )
 
 
 def test_flush_alerts_empty_entries_cleaned():
@@ -348,7 +360,9 @@ def test_terminate_cancels_tasks_before_closing_resources():
     )
     plugin._wizard["u"] = {"step": "room"}
     plugin._last_raw["u"] = {"at": time.time(), "results": {"ac": "raw"}}
-    plugin._events.append({"t": 0, "kind": "poll", "text": "x", "umo": "u"})
+    plugin._events["u"] = deque(
+        [{"t": 0, "kind": "poll", "text": "x", "umo": "u"}], maxlen=60
+    )
     plugin._bind_tokens["u"] = {}
     plugin._lookup_cache["u"] = (0.0, "t")
     plugin._last_room["u"] = {}

@@ -63,7 +63,15 @@ function render() {
 
   // 凭证状态横幅：cookie 已配置 ≠ 学校认。
   // expired = 连续确认失效；suspect = 见到 91001 但连续确认未达标（学校抖动观察中）
+  // unconfirmed = 见到 91001 但探测全关，无法自动确认（不硬判失效）
   var banner = document.getElementById("cred-banner");
+  var obs = d.credential_observation || {};
+  var obsText = "";
+  if (obs.required_minutes) {
+    obsText = "（需连续被拒满 " + obs.required_minutes + " 分钟才判失效" +
+      (obs.elapsed_minutes ? "，已连续 " + obs.elapsed_minutes + " 分钟" : "") +
+      (obs.mixed ? "；期间有 5xx/超时混杂，学校整体故障，窗口已加倍" : "") + "）";
+  }
   if (d.credential_state === "expired") {
     banner.classList.remove("hidden");
     banner.textContent = "🚨 学校凭证已失效（查询返回 91001）：重新获取 JSESSIONID 后私聊机器人发送「/电费 凭证 JSESSIONID=…」即可恢复，绑定与历史不会丢。";
@@ -72,7 +80,13 @@ function render() {
     banner.style.background = "rgba(217,119,6,0.12)";
     banner.style.borderColor = "rgba(217,119,6,0.45)";
     banner.style.color = "#d97706";
-    banner.textContent = "⏳ 学校暂时拒绝了会话（91001），正在观察中：多半是学校服务器抖动，几分钟内常自愈，先等 1~2 分钟。若连续多次都失败，请重新获取 JSESSIONID。";
+    banner.textContent = "⏳ 学校暂时拒绝了会话（91001），正在观察中：多半是学校服务器抖动，几分钟内常自愈，先等 1~2 分钟。若连续多次都失败，请重新获取 JSESSIONID。" + obsText;
+  } else if (d.credential_state === "unconfirmed") {
+    banner.classList.remove("hidden");
+    banner.style.background = "rgba(217,119,6,0.12)";
+    banner.style.borderColor = "rgba(217,119,6,0.45)";
+    banner.style.color = "#d97706";
+    banner.textContent = "⚠️ 学校拒绝了会话（91001），当前未开启自动探测，无法自动确认是否真的失效：可能是学校抖动（几分钟内自愈），也可能是凭证过期——请稍后重试，持续失败再更新凭证。";
   } else {
     banner.classList.add("hidden");
   }
@@ -92,6 +106,7 @@ function render() {
   var credCard =
     credState === "expired" ? { icon: "🔑", label: "学校凭证", value: "已失效" + (age ? " · " + age : ""), cls: "card-alert" }
     : credState === "suspect" ? { icon: "🔑", label: "学校凭证", value: "观察中" + (age ? " · " + age : ""), cls: "card-warn" }
+    : credState === "unconfirmed" ? { icon: "🔑", label: "学校凭证", value: "无法确认" + (age ? " · " + age : ""), cls: "card-warn" }
     : credState === "ok" ? { icon: "🔑", label: "学校凭证", value: "有效" + (age ? " · " + age : ""), cls: "card-success" }
     : d.cookie_ok ? { icon: "🔑", label: "学校凭证", value: "已配置" + (age ? " · " + age : ""), cls: "" }
     : { icon: "🔑", label: "学校凭证", value: "未配置", cls: "card-alert" };
