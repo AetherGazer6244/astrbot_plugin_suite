@@ -92,6 +92,7 @@ ALLOWED_FAKE_SECRETS = {
     "OLD11111": "games 测试假码（旧）占位",
     "NEW22222": "games 测试假码（新）占位",
     "NEWCOD1234": "games 测试假兑换码占位",
+    "OLD12345": "games 测试假兑换码（pending 补发场景）占位",
     "BILICODE1": "games 测试假 B 站兑换码占位",
     "NOSUB1234": "games 测试假兑换码（未订阅场景）占位",
     "HTML1234": "games 测试假公告 id 占位",

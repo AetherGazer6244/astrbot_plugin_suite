@@ -594,6 +594,66 @@ def test_poll_absorbs_codes_from_notice_bodies(tmp_path):
     assert any("新兑换码" in text for _u, text in ctx.sent)
 
 
+def test_broadcast_failure_requeues_and_retries(tmp_path):
+    """红线「发送成功才记账」对兑换码同样成立：广播失败进 pending，下轮补发。
+
+    旧实现的坑：先入库后广播，推送失败不回滚——码在库里但永远不再广播，
+    订阅者永远错过。现在入库归入库、广播归广播，失败下轮补发。
+    """
+    ctx = FakeContext(ok=False)
+    item = _news("1", "前瞻公告", content="<p>兑换码：NEWCOD1234 有效期至2030年1月1日</p>")
+    p = _plugin(tmp_path, config={"push_enabled": True}, items=[item], ctx=ctx)
+    p.store.set_subscription(PRIVATE_UMO, ["re1999"], True)
+    asyncio.run(p._poll_news())
+    # 入库照常（广播失败不影响码库），广播尝试过但没送达 → 码进 pending
+    assert [c["code"] for c in p.store.codes("re1999")] == ["NEWCOD1234"]
+    assert [str(r["code"]) for r in p._pending_code_push["re1999"]] == ["NEWCOD1234"]
+    assert len([t for _u, t in ctx.sent if "新兑换码" in t]) == 1  # 尝试了但 FakeContext 拒收
+
+    # 下轮发送恢复：同一条公告再拉（码已在库，absorb 返回空新码），pending 补发
+    ctx.ok = True
+    asyncio.run(p._poll_news())
+    assert len([t for _u, t in ctx.sent if "新兑换码" in t]) == 2  # 补发成功
+    assert "re1999" not in p._pending_code_push
+
+
+def test_broadcast_no_subscriber_clears_pending(tmp_path):
+    """无活跃订阅者（全静音）不算广播失败：码在库里 /游戏 兑换 可查，pending 清空。
+
+    静音是「别打扰」，不是「永远别告诉我」；留着 pending 只会在静音期间
+    无意义堆积，解除静音后还涌出一批过期前的旧码。
+    """
+    ctx = FakeContext()
+    p = _plugin(tmp_path, config={"push_enabled": True}, items=[], ctx=ctx)
+    p.store.set_subscription(PRIVATE_UMO, ["re1999"], True)
+    p._pending_code_push["re1999"] = [
+        {"code": "OLD12345", "sources": ["bilibili"], "url": "u",
+         "expire_at": time.time() + 3600, "found_at": time.time()},
+    ]
+    # 订阅者存在但正在静音
+    p.store.data["subscriptions"][PRIVATE_UMO]["muted_until"] = time.time() + 600
+    asyncio.run(p._push_codes("re1999", []))
+    assert ctx.sent == []
+    assert "re1999" not in p._pending_code_push
+
+
+def test_poll_isolates_failing_source(tmp_path, monkeypatch):
+    """逐源隔离：一个游戏的入库/推送炸了，不能把整轮轮询带崩（电费 v1.2.0 同款教训）。"""
+    ctx = FakeContext()
+    p = _plugin(tmp_path, config={"push_enabled": True}, items=[_news("1", "方舟公告")], ctx=ctx)
+    p.store.set_subscription(PRIVATE_UMO, ["re1999", "arknights"], True)
+
+    async def boom(self, key, items):
+        if key == "re1999":
+            raise RuntimeError("入库炸了")
+        return []
+
+    monkeypatch.setattr(type(p), "_absorb_codes", boom)
+    asyncio.run(p._poll_news())  # re1999 一路异常被吞掉记日志，整体不抛
+    # re1999 当轮作废，arknights 的公告推送照常送达
+    assert any("明日方舟" in t for _u, t in ctx.sent)
+
+
 def test_poll_backs_off_after_failure(tmp_path):
     p = _plugin(tmp_path, config={"push_enabled": True}, items=[], error=SourceError("挂了"))
     p.store.set_subscription(PRIVATE_UMO, ["re1999"], True)

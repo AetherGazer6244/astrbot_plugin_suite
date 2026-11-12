@@ -52,9 +52,18 @@ class MemoStore:
             }
 
     def save(self):
+        """原子写 tmp+replace + fsync（对齐套件存储红线）。
+
+        备忘虽不如凭证历史关键，但「os.replace 成功而数据还在页缓存」的
+        断电窗口同样存在：replace 后掉电 = 用户记的待办无声消失。写频低
+        （用户动作 + 扫描有变化才写），多一次 fsync 毫无压力。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.data, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.path)
 
     # ================= 增查改 =================

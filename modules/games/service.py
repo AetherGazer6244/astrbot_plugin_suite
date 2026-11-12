@@ -184,7 +184,6 @@ class GamesCore:
         self.bili = None
         self.scheduler: AsyncIOScheduler | None = None
         self._tasks: list[asyncio.Task] = []
-        self._events: list[str] = []
         # AI 摘要缓存：游戏 key → (公告 id 元组, 摘要文本)。内存态，重启清空，
         # 下一轮轮询（≤10 分钟）就会重新预热。
         self._digest_cache: dict[str, tuple[tuple, str]] = {}
@@ -192,6 +191,10 @@ class GamesCore:
         self._digest_tasks: dict[str, asyncio.Task] = {}
         # 数据源名 → {"fail": 连续失败次数, "until": 退避截止时间戳}
         self._failure_backoff: dict[str, dict] = {}
+        # 广播失败的兑换码：key → [records]。下轮轮询先补发，送达才清——
+        # 套件红线「发送成功才记账，失败下轮重发」：入库归入库，广播归广播，
+        # 推送失败不能让用户永远错过一个码（内存态，重启后码仍在库里可查）。
+        self._pending_code_push: dict[str, list[dict]] = {}
         # 最近一次生成二维码的时间，用于本地判过期（省一趟必然失败的请求）
         self._qr_at: float = 0.0
 
@@ -277,7 +280,7 @@ class GamesCore:
             except OSError as e:
                 logger.error(f"[{PLUGIN_NAME}] 退出保存失败：{e}")
         self._failure_backoff.clear()
-        self._events.clear()
+        self._pending_code_push.clear()
 
     # ================= 配置 =================
 
@@ -781,25 +784,37 @@ class GamesCore:
             return False
         return bool(ok)
 
+    # 单游戏 pending 补发上限：码本身有 TTL（默认 24h），正常远到不了这个数；
+    # 防御性硬顶，超出丢最老的（码库里有，/游戏 兑换 还能查到）。
+    MAX_PENDING_CODES_PER_GAME = 20
+
     async def _poll_news(self) -> None:
         for key in self._enabled_games():
             if not self.store:
                 break
-            limit = max(self._max_push() * 3, 15)
-            items = await self._safe_call(
-                f"news:{key}", lambda k=key, n=limit: self._latest(k, n)
-            )
-            if not items:
-                continue
-            # 公告正文兜底扫码要在这批条目记已读之前做：码是新信息，不能因为
-            # 推送失败而被跳过（seen 回滚只影响推送，不影响入库）。
-            # ⚠️ 没有订阅者也要扫——/游戏 兑换 的公告码源全靠这里，与推送无关。
-            await self._broadcast_codes(key, await self._absorb_codes(key, items))
-            # 后台摘要预生成：spawn 后立即继续，绝不阻塞轮询周期
-            self._maybe_refresh_digest(key, items)
-            fresh = await self._new_items(key, items)
-            if fresh and self.store.subscribers(key):
-                await self._push_news(key, fresh, items)
+            # 逐源隔离（电费 v1.2.0 同款教训）：一个游戏的入库/推送/落盘炸了，
+            # 不能把整轮轮询带崩——后面游戏当轮不拉，摘要预热与码入库全部停摆。
+            try:
+                limit = max(self._max_push() * 3, 15)
+                items = await self._safe_call(
+                    f"news:{key}", lambda k=key, n=limit: self._latest(k, n)
+                )
+                if not items:
+                    continue
+                # 公告正文兜底扫码要在这批条目记已读之前做：码是新信息，不能因为
+                # 推送失败而被跳过（seen 回滚只影响推送，不影响入库）。
+                # ⚠️ 没有订阅者也要扫——/游戏 兑换 的公告码源全靠这里，与推送无关。
+                await self._push_codes(key, await self._absorb_codes(key, items))
+                # 后台摘要预生成：spawn 后立即继续，绝不阻塞轮询周期
+                self._maybe_refresh_digest(key, items)
+                fresh = await self._new_items(key, items)
+                if fresh and self.store.subscribers(key):
+                    await self._push_news(key, fresh, items)
+            except Exception as e:
+                logger.error(
+                    f"[{PLUGIN_NAME}] {game_display(key)} 资讯轮询异常（本轮跳过，"
+                    f"下轮继续）：{type(e).__name__}: {e!r}"
+                )
 
     async def _poll_dynamics(self) -> None:
         if not (self.store and self.bili):
@@ -818,6 +833,7 @@ class GamesCore:
             source = f"bili:{key}"
             if self._should_skip(source):
                 continue
+            # 逐源隔离：B站风控/入库异常只废自己这一路，不拖累其他游戏
             try:
                 dyns = await self.bili.dynamics.space_feed(
                     uids.get(key, ""), key, limit=max(self._max_push() * 3, 15)
@@ -829,28 +845,70 @@ class GamesCore:
                 self._note_failure(source, f"{type(e).__name__}: {e}")
                 continue
             self._note_success(source)
-            fresh = await self._new_dynamics(key, dyns)
-            await self._broadcast_codes(key, await self._absorb_dyn_codes(key, dyns))
-            if not fresh:
-                continue
-            body = dynamics_text(fresh[: self._max_push()], game_display(key))
-            for umo, sub in wanted.items():
-                if key not in (sub.get("games") or []):
+            try:
+                fresh = await self._new_dynamics(key, dyns)
+                await self._push_codes(key, await self._absorb_dyn_codes(key, dyns))
+                if not fresh:
                     continue
-                await self._send(umo, f"🆕 {body}")
-            self.store.mark_seen(source, [d.item_id for d in fresh])
-            self.store.save()
+                body = dynamics_text(fresh[: self._max_push()], game_display(key))
+                delivery_failed = False
+                for umo, sub in wanted.items():
+                    if key not in (sub.get("games") or []):
+                        continue
+                    if not await self._send(umo, f"🆕 {body}"):
+                        delivery_failed = True
+                if not delivery_failed:
+                    # 全部送达才记已读；有失败就不记，下轮整批重发（宁重发不漏推）
+                    self.store.mark_seen(source, [d.item_id for d in fresh])
+                    self.store.save()
+            except Exception as e:
+                logger.error(
+                    f"[{PLUGIN_NAME}] {game_display(key)} 动态轮询异常（本轮跳过，"
+                    f"下轮继续）：{type(e).__name__}: {e!r}"
+                )
 
-    async def _broadcast_codes(self, key: str, new_codes: list[dict]) -> None:
-        """新兑换码独立成条推送——用户要的是「能兑」，不是夹在公告里。"""
-        if not new_codes or not self.store:
+    async def _push_codes(self, key: str, new_codes: list[dict]) -> None:
+        """广播新码 + 补发上轮失败的；仍失败的留在 pending，下轮再来。
+
+        红线「发送成功才记账」：入库（absorb）只是登记，广播送达才算数——
+        旧实现入库后推送失败就再也不推，用户永远错过这个码。
+        """
+        if not self.store:
             return
-        body = codes_text(new_codes, game_display(key), self._ttl_hours())
-        for umo, _sub in self.store.subscribers(key):
-            if self.store.is_muted(umo):
-                continue
-            await self._send(umo, f"🎁 {game_display(key)} 有新兑换码\n\n{body}")
-        self.store.save()
+        codes = list(new_codes)
+        pending = self._pending_code_push.get(key, [])
+        if pending:
+            seen = {str(r.get("code")) for r in codes}
+            codes.extend(r for r in pending if str(r.get("code")) not in seen)
+        failed = await self._broadcast_codes(key, codes)
+        if failed:
+            self._pending_code_push[key] = failed[: self.MAX_PENDING_CODES_PER_GAME]
+        else:
+            self._pending_code_push.pop(key, None)
+
+    async def _broadcast_codes(self, key: str, codes: list[dict]) -> list[dict]:
+        """把码广播给订阅了该游戏的会话。返回**未成功送达**的码。
+
+        - 无活跃订阅者（没订阅/全在静音）→ 返回 []：不算失败，码在库里，
+          /游戏 兑换 随时可查；静音是「别打扰」，不是「永远别告诉我」
+        - 有订阅者但任一发送失败 → 整批返回（下轮补发；已收到的重发一次，
+          宁重发不漏推——漏的那个会话才是真损失）
+        """
+        if not codes or not self.store:
+            return []
+        subscribers = [
+            (umo, _sub)
+            for umo, _sub in self.store.subscribers(key)
+            if not self.store.is_muted(umo)
+        ]
+        if not subscribers:
+            return []
+        body = codes_text(codes, game_display(key), self._ttl_hours())
+        all_ok = True
+        for umo, _sub in subscribers:
+            if not await self._send(umo, f"🎁 {game_display(key)} 有新兑换码\n\n{body}"):
+                all_ok = False
+        return [] if all_ok else list(codes)
 
     async def _new_items(self, key: str, items) -> list:
         if not self.store:

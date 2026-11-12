@@ -82,10 +82,11 @@ def make_games_plugin(config=None, store=None, sources=None, bili=None, context=
     plugin.bili = bili
     plugin.scheduler = scheduler
     plugin._tasks = []
-    plugin._events = []
     plugin._digest_cache = {}
     plugin._digest_tasks = {}
     plugin._failure_backoff = {}
+    plugin._pending_code_push = {}
+    plugin._qr_at = 0.0
     return plugin
 
 
