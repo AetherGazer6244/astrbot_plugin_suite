@@ -73,16 +73,19 @@ def credential_state(plugin, bindings: dict) -> str:
     """从各会话最近一次查询结果推断学校凭证状态（不发额外请求）。
 
     - "expired"：有会话拿到 91001、无任何一路拿到余额，且连续确认计数达标
-      （插件 CREDENTIAL_CONFIRM_STRIKES，跨轮询/保活周期）→ 凭证确定失效
-    - "suspect"：见到 91001 但连续确认未达标 → 学校抖动观察期（学校发癫时
+      **且连续被拒时长达到时间窗**（插件 credential_confirm_min_span_minutes）
+      → 凭证确定失效
+    - "suspect"：见到 91001 但未达确认门槛 → 学校抖动观察期（学校发癫时
       会话即生即死、几分钟自愈），别渲染成红条吓用户去换凭证
+    - "unconfirmed"：见到 91001 但探测全关，没有自动确认机制 → 如实说
+      「无法确认」，不硬判失效
     - "ok"：任一路拿到过余额 → 学校认了会话
     - "unknown"：没数据（没绑定/还没轮询过/网络失败）——不能断言，别吓用户
 
     cookie 已配置但学校不认（「已配置」≠「有效」）正是 v1.1.x 仪表盘的盲区。
 
-    ⚠️ 判定口径必须与 main._credential_suspect_mode 一致：探测（轮询/保活）
-    全关时没有连续确认机制，不能一直挂在「观察中」——直接判失效。
+    ⚠️ 判定口径必须与 main._credential_display_mode 一致：探测（轮询/保活）
+    全关时没有连续确认机制，不能一直挂在「观察中」——但也不能直接判失效。
     """
     expired = False
     ok_seen = False
@@ -101,10 +104,29 @@ def credential_state(plugin, bindings: dict) -> str:
         suspect_mode = getattr(plugin, "_credential_suspect_mode", None)
         if callable(suspect_mode) and suspect_mode():
             return "suspect"
-        return "expired"
+        # 探测全关：既没到确认门槛，也没有观察机制——如实说「无法确认」，
+        # 别渲染成红色的「已失效」（学校抖动会被误伤，用户白折腾重提凭证）。
+        return "unconfirmed"
     if ok_seen:
         return "ok"
     return "unknown"
+
+
+def _observation(plugin) -> dict:
+    """观察期进度（纯时间信息，无凭证值）：连续被拒多久 / 还需多久确认。"""
+    try:
+        first_at = float(plugin._expired_first_at())
+        need = float(plugin._confirm_span_minutes())
+        mixed = bool(plugin._expired_mixed())
+    except Exception:
+        return {}
+    if first_at <= 0:
+        return {"required_minutes": need, "elapsed_minutes": 0.0, "mixed": mixed}
+    return {
+        "required_minutes": need,
+        "elapsed_minutes": round((time.time() - first_at) / 60.0, 1),
+        "mixed": mixed,
+    }
 
 
 async def overview(plugin) -> dict:
@@ -125,6 +147,8 @@ async def overview(plugin) -> dict:
                 # set_at=最后一次手动更新；last_ok_at/last_expired_at/
                 # last_net_fail_at=学校最近一次认/拒绝/失联
                 "credential_meta": meta,
+                # 观察期进度（时间窗）：让仪表盘说清「还在等多久才判失效」
+                "credential_observation": _observation(plugin),
                 "poll_interval_minutes": plugin._cfg_int("poll_interval_minutes", 20),
                 "keepalive_interval_minutes": plugin._cfg_int(
                     "keepalive_interval_minutes", 8

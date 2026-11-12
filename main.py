@@ -92,7 +92,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "功能套件：宿舍电费监控 + 游戏资讯聚合 + 备忘录提醒，一个插件装齐，模块可按配置档开关",
-    "1.0.0",
+    "1.1.0",
 )
 class SuitePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

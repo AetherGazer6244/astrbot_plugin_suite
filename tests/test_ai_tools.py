@@ -1384,17 +1384,17 @@ def test_trend_days_capped_at_sixty():
 
 def test_check_tool_renders_and_is_readonly_in_group():
     plugin = _plugin(bindings={GROUP_UMO: _binding(history=True)})
-    before = len(plugin._events)
+    before = len(plugin._events.get(GROUP_UMO, ()))
     text = _call(
         plugin, plugin.tool_dorm_electric_check(_FakeEvent(GROUP_UMO, private=False))
     )
     assert "🔎 电费自检" in text
     assert "实时查询" in text
     assert "SECRET" not in text
-    # 事件按 umo 过滤：群会话看不到私聊事件，且自检事件记在群会话名下
-    assert all(
-        ev["umo"] == GROUP_UMO for ev in list(plugin._events)[before:]
-    )
+    # 事件按会话桶隔离：自检事件记在群会话名下（新事件 = 桶尾新增的）
+    new_events = list(plugin._events.get(GROUP_UMO, ()))[before:]
+    assert new_events
+    assert all(ev["umo"] == GROUP_UMO for ev in new_events)
 
 
 def test_check_tool_reports_credential_missing():

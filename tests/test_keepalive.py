@@ -194,7 +194,11 @@ def test_keepalive_first_expiry_only_enters_observation():
 
 
 def test_keepalive_expired_notifies_and_marks_dead():
-    """连续第二次 91001 → 标记失效 + 发通知（失效期唯一的推送）。"""
+    """连续被拒 + 时间窗已满 → 标记失效 + 发通知（失效期唯一的推送）。
+
+    时间窗是第三道防线：保活每 8 分钟一次，学校抖 8~16 分钟绝不能判失效
+    （实录学校整段发癫 40 分钟！）。这里模拟「已连续被拒 31 分钟」。
+    """
     store = _Store({UMO: _binding()})
     plugin = make_plugin(
         config=_CFG, store=store, hjnu=_Areas(SessionExpiredError("会话已超时"))
@@ -203,13 +207,32 @@ def test_keepalive_expired_notifies_and_marks_dead():
     plugin._send = _send
 
     asyncio.run(plugin._keepalive_tick())  # 第一次：观察期
+    # 模拟「已经连续被拒 31 分钟」
+    store.data["credential"]["expired_first_at"] = time.time() - 31 * 60
     asyncio.run(plugin._keepalive_tick())  # 第二次：确认失效
 
     assert store.data["credential"]["last_expired_at"] > 0
     assert store.get_binding(UMO)["credential_dead"] is True
     assert len(sent) == 1
     assert "凭证已失效" in sent[0][1]
-    assert any(e["kind"] == "credential" for e in plugin._events)
+    assert any(e["kind"] == "credential" for e in plugin._events.get(UMO, ()))
+
+
+def test_keepalive_not_dead_before_time_window():
+    """连续被拒但时间窗未满 → 不判失效、不发通知（学校抖动防误报）。"""
+    store = _Store({UMO: _binding()})
+    plugin = make_plugin(
+        config=_CFG, store=store, hjnu=_Areas(SessionExpiredError("会话已超时"))
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._keepalive_tick())
+    asyncio.run(plugin._keepalive_tick())
+
+    assert store.data["credential"]["expired_strikes"] == 2
+    assert not store.get_binding(UMO).get("credential_dead")
+    assert sent == []
 
 
 def test_keepalive_net_fail_preserves_state():

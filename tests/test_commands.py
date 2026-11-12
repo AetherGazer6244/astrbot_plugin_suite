@@ -94,9 +94,16 @@ class _Store:
 # ================= _notify_session_dead =================
 
 
-def _confirm_strikes(store, count=2):
-    """把连续 91001 计数顶到确认阈值（未达阈值不发失效通知）。"""
-    store.data.setdefault("credential", {})["expired_strikes"] = count
+def _confirm_strikes(store, count=2, minutes=31):
+    """把连续 91001 计数顶到确认阈值，并让时间窗已满足。
+
+    未达阈值/未满时间窗时不发失效通知（学校抖动别去骚扰用户）。
+    minutes=31 表示「已连续被拒 31 分钟」——默认时间窗 30 分钟。
+    """
+    meta = store.data.setdefault("credential", {})
+    meta["expired_strikes"] = count
+    meta["expired_first_at"] = time.time() - minutes * 60
+    meta["expired_mixed"] = False
 
 
 def test_dead_notify_sends_and_records():
@@ -368,7 +375,11 @@ def test_poll_first_91001_is_only_suspect():
 
 
 def test_poll_marks_credential_dead_and_notifies():
-    """连续第二次 91001 → 标记失效 + 发失效通知（失效期唯一的推送）。"""
+    """连续被拒 + 时间窗已满 → 标记失效 + 发失效通知（失效期唯一的推送）。
+
+    时间窗是第三道防线：学校抖 8 分钟不算凭证过期，必须连着抖满 30 分钟。
+    这里用「把起点往前挪 31 分钟」模拟时间窗已满足。
+    """
     store = _Store({UMO: _two_fee_binding()})
     plugin = make_plugin(
         store=store,
@@ -378,6 +389,8 @@ def test_poll_marks_credential_dead_and_notifies():
     plugin._send = _send
 
     asyncio.run(plugin._poll_all())  # 第一次：观察期
+    # 模拟「已经连续被拒 31 分钟」（学校整段发癫 30 分钟以上才判失效）
+    store.data["credential"]["expired_first_at"] = time.time() - 31 * 60
     asyncio.run(plugin._poll_all())  # 第二次：确认失效
 
     binding = store.get_binding(UMO)
@@ -385,7 +398,25 @@ def test_poll_marks_credential_dead_and_notifies():
     assert len(sent) == 1  # 两个费种都失效，但 24h 去重后只发一条
     assert "凭证已失效" in sent[0][1]
     # 状态变化记进事件流（/电费 日志 可见）
-    assert any(e["kind"] == "credential" for e in plugin._events)
+    assert any(e["kind"] == "credential" for e in plugin._events.get(UMO, ()))
+
+
+def test_poll_does_not_mark_dead_before_time_window():
+    """连续被拒但时间窗未满 → 不判失效、不通知（学校抖 8 分钟不算过期）。"""
+    store = _Store({UMO: _two_fee_binding()})
+    plugin = make_plugin(
+        store=store,
+        hjnu=_KindProvider({AC_AID: _expired(), ELEC_AID: _expired()}),
+    )
+    sent, _send = _recorder()
+    plugin._send = _send
+
+    asyncio.run(plugin._poll_all())
+    asyncio.run(plugin._poll_all())  # 计数已经到 2
+
+    assert store.data["credential"]["expired_strikes"] == 2
+    assert not store.get_binding(UMO).get("credential_dead")
+    assert sent == []
 
 
 def test_poll_clears_strikes_when_school_accepts():

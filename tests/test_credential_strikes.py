@@ -1,14 +1,22 @@
-"""凭证失效误报修复（v1.3.0）：Provider 层 91001 复验 + 连续确认计数。
+"""凭证失效误报修复：Provider 层阶梯复验 + 连续确认计数 + 时间窗。
 
 背景：学校缴费系统夜里「发癫」时会把**还活着的会话**临时判成 91001
-（实录：会话即生即死、几分钟后自愈）。旧实现是单次 91001 就发失效通知 +
-置 credential_dead，用户被叫去重新提取凭证——纯白折腾。
+（实录：会话即生即死、几分钟后自愈，整段发癫可达 40 分钟）。旧实现是
+单次 91001 就发失效通知 + 置 credential_dead，用户被叫去重新提取凭证
+——纯白折腾。
 
-两道防线：
-1. Provider 层：91001 隔 EXPIRED_RECHECK_DELAY 秒原样重发一次，复验通过就
-   当抖动处理（挡秒级抖动）。
+三道防线：
+1. Provider 层：91001 按 EXPIRED_RECHECK_DELAYS 阶梯复验（2.5s→8s），
+   每次换一条**全新连接**（不复用共享 client）——挡秒级抖动 + 换节点。
+   任一级复验通过就当抖动处理。
 2. main 层：连续 CREDENTIAL_CONFIRM_STRIKES 次（跨轮询/保活周期）才发通知、
-   才置 credential_dead（挡分钟级抖动）；网络失败不推进计数，任一路余额清零。
+   才置 credential_dead（挡「两次探测凑巧撞上抖动」）。
+3. main 层时间窗：连续被拒必须**持续满 N 分钟**（默认 30）才判失效——
+   挡「学校连着抖 8 分钟以上」这种整段发癫。没有它的话，保活 8 分钟一次
+   就能把计数凑到 2，学校抖 8 分钟就被误判成凭证已失效。
+   窗口内若出现 5xx/超时混杂（学校整体故障形态），窗口自动加倍。
+
+网络失败不推进计数；任一路余额取到即清零（含时间窗起点）。
 """
 
 import asyncio
@@ -74,7 +82,7 @@ def _provider(script, monkeypatch):
     return provider, calls
 
 
-# ================= Provider 层：91001 复验 =================
+# ================= Provider 层：91001 阶梯复验 =================
 
 
 def test_query_room_91001_then_ok_is_treated_as_flap(monkeypatch):
@@ -93,8 +101,25 @@ def test_query_room_91001_then_ok_is_treated_as_flap(monkeypatch):
     assert len(calls) == 2  # 复验确实重发了一次
 
 
-def test_query_room_91001_twice_is_expired(monkeypatch):
-    """复验仍 91001 → 真失效（会话已失效）。"""
+def test_query_room_91001_then_91001_then_ok_is_treated_as_flap(monkeypatch):
+    """阶梯复验：第一级仍 91001、第二级通过 → 照样当抖动（分钟级抖动）。"""
+    provider, calls = _provider(
+        [
+            (200, json.dumps(EXPIRED)),
+            (200, json.dumps(EXPIRED)),
+            (200, json.dumps(OK_BALANCE)),
+        ],
+        monkeypatch,
+    )
+    result = asyncio.run(provider.query_room(ROOM_PARAMS))
+    assert result.ok is True
+    assert result.value == 94.66
+    assert result.session_expired is False
+    assert len(calls) == 3
+
+
+def test_query_room_91001_whole_ladder_is_expired(monkeypatch):
+    """整条阶梯都 91001 → 真失效（会话已失效）。"""
     provider, calls = _provider(
         [(200, json.dumps(EXPIRED)), (200, json.dumps(EXPIRED))],
         monkeypatch,
@@ -102,7 +127,8 @@ def test_query_room_91001_twice_is_expired(monkeypatch):
     result = asyncio.run(provider.query_room(ROOM_PARAMS))
     assert result.ok is False
     assert result.session_expired is True
-    assert len(calls) == 2
+    # 原请求 + 整条阶梯（2 级）
+    assert len(calls) == 1 + len(http_json.EXPIRED_RECHECK_DELAYS)
 
 
 def test_list_areas_91001_then_ok_is_treated_as_flap(monkeypatch):
@@ -119,7 +145,7 @@ def test_list_areas_91001_then_ok_is_treated_as_flap(monkeypatch):
     assert len(calls) == 2
 
 
-def test_list_areas_91001_twice_raises_session_expired(monkeypatch):
+def test_list_areas_91001_whole_ladder_raises_session_expired(monkeypatch):
     provider, calls = _provider(
         [(200, json.dumps(EXPIRED)), (200, json.dumps(EXPIRED))],
         monkeypatch,
@@ -129,13 +155,39 @@ def test_list_areas_91001_twice_raises_session_expired(monkeypatch):
     except SessionExpiredError:
         pass
     else:
-        raise AssertionError("复验仍 91001 时应抛 SessionExpiredError")
-    assert len(calls) == 2
+        raise AssertionError("整条阶梯都 91001 时应抛 SessionExpiredError")
+    assert len(calls) == 1 + len(http_json.EXPIRED_RECHECK_DELAYS)
 
 
 def test_recheck_delay_is_short(monkeypatch):
-    """复验延迟是秒级常量（太长会拖慢用户查询）。"""
+    """复验延迟阶梯：首级是秒级（太长会拖慢用户查询）。"""
     assert 0 < http_json.EXPIRED_RECHECK_DELAY <= 5
+    assert http_json.EXPIRED_RECHECK_DELAYS[0] == http_json.EXPIRED_RECHECK_DELAY
+
+
+def test_recheck_ladder_is_bounded(monkeypatch):
+    """阶梯总时长有上限（不能无限等学校）。"""
+    assert len(http_json.EXPIRED_RECHECK_DELAYS) >= 2
+    assert sum(http_json.EXPIRED_RECHECK_DELAYS) <= 15
+
+
+def test_recheck_uses_fresh_connection(monkeypatch):
+    """复验必须换新连接：学校是多后端节点，同节点可能持续返回 91001。
+
+    断言方式：复验走的是独立的一次性 client（不进共享池、不进退休池）。
+    """
+    provider, _calls = _provider(
+        [
+            (200, json.dumps(EXPIRED)),
+            (200, json.dumps(OK_BALANCE)),
+        ],
+        monkeypatch,
+    )
+    asyncio.run(provider.query_room(ROOM_PARAMS))
+    # 共享 client 未被换掉（业务连接还在用），退休池也为空
+    assert provider._retired == []
+    assert provider._client is not None
+    assert not provider._client.is_closed
 
 
 # ================= main 层：连续确认计数 =================
@@ -146,7 +198,8 @@ def _plugin(store=None):
     return make_plugin(store=store), store
 
 
-def test_strikes_increment_and_confirm():
+def test_strikes_increment_but_not_confirmed_before_window():
+    """计数到了也先不判失效——时间窗没到之前一律只观察。"""
     plugin, store = _plugin()
     assert plugin._expired_strikes() == 0
     assert plugin._credential_dead_confirmed() is False
@@ -157,8 +210,20 @@ def test_strikes_increment_and_confirm():
 
     plugin._update_expired_strikes(expired=True)
     assert plugin._expired_strikes() == 2
-    assert plugin._credential_dead_confirmed() is True
     assert store.data["credential"]["expired_strikes"] == 2
+    # 连续被拒刚起步，时间窗没到 → 不判失效（学校抖 8 分钟不算凭证过期）
+    assert plugin._credential_dead_confirmed() is False
+
+
+def test_strikes_confirmed_after_time_window():
+    """连续被拒满时间窗 → 判定凭证确实失效。"""
+    plugin, store = _plugin()
+    plugin._update_expired_strikes(expired=True)
+    plugin._update_expired_strikes(expired=True)
+    # 把连续被拒起点往前挪 31 分钟，模拟「已连续被拒 31 分钟」
+    meta = store.data["credential"]
+    meta["expired_first_at"] = meta["expired_first_at"] - 31 * 60
+    assert plugin._credential_dead_confirmed() is True
 
 
 def test_strikes_cleared_by_ok():
@@ -170,12 +235,54 @@ def test_strikes_cleared_by_ok():
     assert plugin._credential_dead_confirmed() is False
 
 
+def test_ok_clears_time_window_start():
+    """学校恢复了 → 时间窗起点也一并清零（下一轮从零开始算）。"""
+    plugin, store = _plugin()
+    plugin._update_expired_strikes(expired=True)
+    assert store.data["credential"]["expired_first_at"] > 0
+    plugin._update_expired_strikes(ok=True)
+    assert store.data["credential"]["expired_first_at"] == 0
+
+
 def test_network_failure_does_not_touch_strikes():
     """网络失败既不推进也不清除观察进度（ok=False, expired=False）。"""
     plugin, _store = _plugin()
     plugin._update_expired_strikes(expired=True)
     plugin._update_expired_strikes(ok=False, expired=False)
     assert plugin._expired_strikes() == 1
+
+
+def test_mixed_failure_marks_window_and_doubles_it():
+    """连续被拒期间出现 5xx/超时（学校整体发癫的形态）→ 判定窗口加倍。"""
+    plugin, store = _plugin()
+    plugin._update_expired_strikes(expired=True)
+    plugin._update_expired_strikes(expired=True)
+    base_span = plugin._confirm_span_minutes()
+    assert store.data["credential"].get("expired_mixed") is not True
+
+    plugin._update_expired_strikes(net_fail=True)
+
+    assert store.data["credential"]["expired_mixed"] is True
+    assert plugin._confirm_span_minutes() == base_span * 2
+    # 计数不动（网络失败不推进）
+    assert plugin._expired_strikes() == 2
+
+
+def test_mixed_failure_cleared_by_ok():
+    """学校恢复 → 混杂标记一并清零（下一轮重新判断形态）。"""
+    plugin, store = _plugin()
+    plugin._update_expired_strikes(expired=True)
+    plugin._update_expired_strikes(net_fail=True)
+    assert store.data["credential"]["expired_mixed"] is True
+    plugin._update_expired_strikes(ok=True)
+    assert store.data["credential"]["expired_mixed"] is False
+
+
+def test_confirm_span_is_configurable():
+    """时间窗可配（学校频繁整段发癫就调大，想早发现就调小）。"""
+    plugin, _store = _plugin()
+    plugin.config["credential_confirm_min_span_minutes"] = 45
+    assert plugin._confirm_span_minutes() == 45
 
 
 def test_strikes_survive_restart():

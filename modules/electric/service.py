@@ -29,6 +29,7 @@ try:
     from .formatting import (
         CREDENTIAL_HINT,
         CREDENTIAL_SUSPECT_HINT,
+        CREDENTIAL_UNCONFIRMED_HINT,
         ROOM_PAGE_SIZE,
         alert_hint,
         credential_state,
@@ -70,6 +71,7 @@ except ImportError:  # 兜底：被以非包方式加载时
     from formatting import (  # type: ignore
         CREDENTIAL_HINT,
         CREDENTIAL_SUSPECT_HINT,
+        CREDENTIAL_UNCONFIRMED_HINT,
         ROOM_PAGE_SIZE,
         alert_hint,
         credential_state,
@@ -180,7 +182,11 @@ class ElectricCore:
         self.scheduler: AsyncIOScheduler | None = None
         self._wizard: dict[str, dict] = {}
         self._tasks: list[asyncio.Task] = []
-        self._events: deque = deque(maxlen=200)
+        # 内存事件流按会话隔离：umo → deque（每会话各自有界）。
+        # 旧实现是全局单 deque：一个活跃群一次批量预警就能把其他会话的
+        # 事件全部挤掉，/电费 日志 与自检的「最近事件」瞬间变空窗——
+        # 而且事件本来就按 umo 过滤展示，全局混存毫无意义。
+        self._events: dict[str, deque] = {}
         self._pending_alerts: dict[str, list[dict]] = {}
         self._last_raw: dict[str, dict[str, Any]] = {}
         # AI 写操作待确认项：umo → {code, action, at, user_ok, ...}
@@ -360,15 +366,25 @@ class ElectricCore:
             "room", "未知房间"
         )
 
-    # ================= 凭证失效判定（两层防线） =================
+    # ================= 凭证失效判定（三层防线） =================
     #
-    # 第一层（Provider）：91001 隔 EXPIRED_RECHECK_DELAY 秒原样重发一次，
-    #   复验通过就当学校抖动——挡秒级抖动。
+    # 第一层（Provider）：91001 隔 EXPIRED_RECHECK_DELAYS 阶梯复验，每次
+    #   换一条新连接——挡秒级抖动 + 换节点（见 http_json.py）。
     # 第二层（这里）：91001 连续出现 CREDENTIAL_CONFIRM_STRIKES 次
-    #   （跨轮询/保活周期）才判定凭证失效并通知用户——挡分钟级抖动。
-    # 学校夜里「发癫」时活着的会话会被临时判 91001（实录：会话即生即死、
-    # 几分钟自愈），单次就催用户重新提取凭证纯属白折腾。
+    #   （跨轮询/保活周期）才判定凭证失效——挡「两次探测凑巧撞上抖动」。
+    # 第三层（这里，时间窗）：连续被拒必须**持续够久**才判失效
+    #   （credential_confirm_min_span_minutes，默认 30 分钟）——
+    #   挡「学校连着抖 8 分钟以上」这种整段发癫（实录 21:35-22:15 抖了
+    #   40 分钟！）。没有时间窗的话，保活 8 分钟一次就能把计数凑到 2，
+    #   学校抖 8 分钟就被误判成「凭证已失效」，用户白折腾重提一次凭证。
+    # 故障形态旁证：真过期是**纯 91001 连环**；学校整体发癫是
+    #   91001 与 5xx/超时**混杂**。窗口内见到混杂 → 时间窗加倍。
     CREDENTIAL_CONFIRM_STRIKES: ClassVar[int] = 2
+
+    # 连续被拒多久才判失效（分钟）。可在配置里调；<=0 视为用默认值。
+    CREDENTIAL_CONFIRM_MIN_SPAN_MINUTES: ClassVar[float] = 30.0
+    # 窗口内出现混杂失败（91001 与 5xx/超时同时出现）→ 时间窗乘数
+    CREDENTIAL_MIXED_SPAN_MULTIPLIER: ClassVar[float] = 2.0
 
     def _expired_strikes(self) -> int:
         """连续 91001 计数（持久化在 store.data["credential"]，重启不清零）。"""
@@ -380,9 +396,51 @@ class ElectricCore:
         except (TypeError, ValueError):
             return 0
 
+    def _expired_first_at(self) -> float:
+        """当前这轮连续被拒的起点（0 = 当前没有连续被拒）。
+
+        时间窗从它开始算：只有「持续拒绝满 N 分钟」才判失效。
+        """
+        meta = self.store.data.get("credential") if self.store else None
+        if not isinstance(meta, dict):
+            return 0.0
+        try:
+            return float(meta.get("expired_first_at", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _expired_mixed(self) -> bool:
+        """当前这轮连续被拒期间是否出现过混杂失败（学校整体发癫的形态）。"""
+        meta = self.store.data.get("credential") if self.store else None
+        if not isinstance(meta, dict):
+            return False
+        return bool(meta.get("expired_mixed"))
+
+    def _confirm_span_minutes(self) -> float:
+        """判定失效所需的连续被拒时长（分钟）。
+
+        混杂失败（91001 与 5xx/超时同时出现）→ 加倍。学校整体发癫时
+        时间窗翻倍，等于「除非长时间稳定地只报 91001，否则不判失效」。
+        """
+        minutes = self._cfg_float(
+            "credential_confirm_min_span_minutes", self.CREDENTIAL_CONFIRM_MIN_SPAN_MINUTES
+        )
+        if minutes <= 0:
+            minutes = self.CREDENTIAL_CONFIRM_MIN_SPAN_MINUTES
+        if self._expired_mixed():
+            minutes *= self.CREDENTIAL_MIXED_SPAN_MULTIPLIER
+        return minutes
+
     def _credential_dead_confirmed(self) -> bool:
-        """连续确认次数达标 → 凭证确定失效。"""
-        return self._expired_strikes() >= self.CREDENTIAL_CONFIRM_STRIKES
+        """连续确认次数达标 **且** 连续被拒时长够久 → 凭证确定失效。"""
+        if self._expired_strikes() < self.CREDENTIAL_CONFIRM_STRIKES:
+            return False
+        first_at = self._expired_first_at()
+        if first_at <= 0:
+            # 老数据只有计数没有起点（旧版本存的）：拿不到时间窗依据，
+            # 保守起见不判失效，等下一轮探测重新起算。
+            return False
+        return (time.time() - first_at) >= self._confirm_span_minutes() * 60.0
 
     def _credential_probe_enabled(self) -> bool:
         """是否还有定时探测在跑（轮询或保活）——没有确认机制就别让用户干等。"""
@@ -391,27 +449,63 @@ class ElectricCore:
             or self._cfg_int("keepalive_interval_minutes", 8) > 0
         )
 
+    def _credential_display_mode(self) -> str:
+        """凭证状态的呈现口径：expired / suspect / unconfirmed。
+
+        - expired：已确认失效（连续被拒够久）→ 明确告诉用户去换凭证
+        - suspect：还在观察期（探测开着，但没到确认门槛）→ 说「疑似 + 等一等」
+        - unconfirmed：探测全关，没有自动确认机制 → 不硬说「已失效」，
+          也不假装「在观察」，只如实说「学校拒绝了会话，无法自动确认」
+        """
+        if self._credential_dead_confirmed():
+            return "expired"
+        if self._credential_probe_enabled():
+            return "suspect"
+        return "unconfirmed"
+
     def _credential_suspect_mode(self) -> bool:
         """当前是否处于「疑似失效、观察中」阶段。
 
         连续确认只由定时探测推进（轮询/保活）：交互查询不推进计数——
         否则用户在抖动期间狂敲 /电费 查询 会把抖动顶成「确认失效」，
-        误报照旧。探测全关时没有确认机制，直接按失效呈现。
+        误报照旧。探测全关时没有确认机制，直接按「无法确认」呈现。
         """
-        if self._credential_dead_confirmed():
-            return False
-        return self._credential_probe_enabled()
+        return self._credential_display_mode() == "suspect"
 
     def _credential_hint_text(self) -> str:
         """凭证失效提示文案：确认失效用确定语气，观察期用「疑似 + 等一等」。"""
-        return CREDENTIAL_SUSPECT_HINT if self._credential_suspect_mode() else CREDENTIAL_HINT
+        mode = self._credential_display_mode()
+        if mode == "expired":
+            return CREDENTIAL_HINT
+        if mode == "unconfirmed":
+            return CREDENTIAL_UNCONFIRMED_HINT
+        return CREDENTIAL_SUSPECT_HINT
 
-    def _update_expired_strikes(self, *, ok: bool = False, expired: bool = False) -> int:
-        """更新连续 91001 计数并落盘，返回最新计数。
+    def _credential_observation_line(self) -> str:
+        """观察期状态描述（/电费 检查 与仪表盘用）：让用户知道系统在等什么。"""
+        first_at = self._expired_first_at()
+        need = self._confirm_span_minutes()
+        if first_at <= 0:
+            return (
+                f"判定策略：需连续被拒满 {need:g} 分钟才判失效"
+                f"（当前未处于连续被拒状态）"
+            )
+        elapsed = (time.time() - first_at) / 60.0
+        return (
+            f"判定策略：需连续被拒满 {need:g} 分钟才判失效"
+            f"；已连续被拒 {elapsed:.1f} 分钟"
+            + ("（期间有 5xx/超时混杂 → 学校整体故障，窗口已加倍）" if self._expired_mixed() else "")
+        )
 
-        - 学校认（任一路拿到余额）→ 清零
-        - 学校明确拒绝（91001，已经过 Provider 层复验）→ +1
-        - 网络/接口失败 → 不动（抖动既不推进也不清除观察进度）
+    def _update_expired_strikes(
+        self, *, ok: bool = False, expired: bool = False, net_fail: bool = False
+    ) -> int:
+        """更新连续 91001 计数与时间窗状态并落盘，返回最新计数。
+
+        - 学校认（任一路拿到余额）→ 清零（含时间窗起点与混杂标记）
+        - 学校明确拒绝（91001，已经过 Provider 层复验）→ +1，连续被拒计时开始
+        - 网络/接口失败 → 不动计数，但若正处于连续被拒期，标记为「混杂」
+          （真过期是纯 91001 连环；91001 与 5xx/超时混杂更像学校整体发癫）
         一个轮询/保活周期只调用一次（凭证是全局的，与绑定数无关）。
         """
         if not self.store:
@@ -421,23 +515,44 @@ class ElectricCore:
             meta = {}
             self.store.data["credential"] = meta
         if ok:
-            if not meta.get("expired_strikes"):
+            if (
+                not meta.get("expired_strikes")
+                and not meta.get("expired_first_at")
+                and not meta.get("expired_mixed")
+            ):
                 # 计数本来就是 0：不必写盘。保活每 8 分钟一次，
                 # 无脑 force save 等于每 8 分钟重写一遍整份历史文件。
                 return 0
             logger.info(f"[{PLUGIN_NAME}] 凭证被学校认可，连续 91001 观察计数清零")
             meta["expired_strikes"] = 0
+            meta["expired_first_at"] = 0
+            meta["expired_mixed"] = False
             self.store.save(force=True)
             return 0
         if not expired:
+            # 网络/学校故障：既不推进也不清除观察进度。
+            # 但若正处于连续被拒期，记一笔「混杂」——学校整体发癫的形态。
+            if net_fail and self._expired_strikes() > 0 and not meta.get("expired_mixed"):
+                meta["expired_mixed"] = True
+                self.store.save(force=True)
+                logger.info(
+                    f"[{PLUGIN_NAME}] 连续被拒期间出现 5xx/超时（混杂），"
+                    "判定时间窗加倍"
+                )
             return self._expired_strikes()
         strikes = self._expired_strikes() + 1
         meta["expired_strikes"] = strikes
+        if not meta.get("expired_first_at"):
+            # 这一轮连续被拒的起点（第一击）。时间窗从这里开始算。
+            meta["expired_first_at"] = time.time()
+        if net_fail:
+            meta["expired_mixed"] = True
         self.store.save(force=True)
         if strikes < self.CREDENTIAL_CONFIRM_STRIKES:
             logger.info(
                 f"[{PLUGIN_NAME}] 学校拒绝会话（91001，连续第 {strikes} 次，"
-                f"达到 {self.CREDENTIAL_CONFIRM_STRIKES} 次才判定凭证失效）"
+                f"达到 {self.CREDENTIAL_CONFIRM_STRIKES} 次且连续被拒满 "
+                f"{self._confirm_span_minutes():g} 分钟才判定凭证失效）"
             )
         return strikes
 
@@ -500,7 +615,7 @@ class ElectricCore:
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
         keep_days = self._cfg_int("history_keep_days", 60)
-        suspect = self._credential_suspect_mode()
+        mode = self._credential_display_mode()
         lines = []
         ok_count = 0
         for kind, result in results.items():
@@ -511,10 +626,15 @@ class ElectricCore:
                 lines.append(self._fee_text(kind, result))
                 ok_count += 1
             elif result and result.session_expired:
-                if suspect:
-                    lines.append(f"{self._fee_name(kind)}：疑似凭证失效（学校抖动观察中）")
-                else:
+                if mode == "expired":
                     lines.append(f"{self._fee_name(kind)}：凭证已失效")
+                elif mode == "unconfirmed":
+                    lines.append(
+                        f"{self._fee_name(kind)}：学校拒绝了会话"
+                        "（未开启自动探测，无法自动确认是否失效）"
+                    )
+                else:
+                    lines.append(f"{self._fee_name(kind)}：疑似凭证失效（学校抖动观察中）")
             elif result:
                 lines.append(f"{self._fee_name(kind)}：查询失败：{result.raw}")
         return lines, ok_count
@@ -612,8 +732,9 @@ class ElectricCore:
         """清理按会话缓存的内存态，防止长期运行只增不减（每轮轮询跑一次）。
 
         原则：已绑定会话的一切都保留；没绑定的只留「最近还在用」的。
-        验证码走 _purge_tokens（TTL 语义在那里）；_lookup_cache 按查询文本
-        键控且已有 200 条上限淘汰，都不在这里重复管。
+        验证码走 _purge_tokens（TTL 语义在那里）；_lookup_cache 的条目
+        自身有 TTL（ai_lookup_cache_seconds），过期即清——之前只有
+        「200 条上限」的被动淘汰，命中率永远为零的死条目会一直占位。
         """
         now = time.time()
         bound = set(self.store.data.get("bindings", {})) if self.store else set()
@@ -621,6 +742,11 @@ class ElectricCore:
         # 过期静音（评估时只是跳过，条目本身会留着）
         for umo in [u for u, until in self._alert_muted.items() if until < now]:
             self._alert_muted.pop(umo, None)
+        # 反查缓存：条目级 TTL 到期即清（无论会话是否还绑定着——它只是缓存）
+        ttl = max(1, self._cfg_int("ai_lookup_cache_seconds", 60))
+        for key, (ts, _text) in list(self._lookup_cache.items()):
+            if now - ts >= ttl:
+                self._lookup_cache.pop(key, None)
         # 无绑定且 7 天无活动的会话：房间记忆与最近原始返回一并清掉
         stale = now - 7 * 24 * 3600
         for umo, memo in list(self._last_room.items()):
@@ -629,6 +755,12 @@ class ElectricCore:
         for umo, wrap in list(self._last_raw.items()):
             if umo not in bound and float(wrap.get("at", 0) or 0) < stale:
                 self._last_raw.pop(umo, None)
+        # 事件流：空桶与「无绑定 + 7 天没动静」的整桶清掉
+        # （硬顶在 _cap_event_sessions，这里管长尾的渐进回收）
+        for umo, bucket in list(self._events.items()):
+            last_t = float(bucket[-1].get("t", 0) or 0) if bucket else 0.0
+            if not bucket or (umo not in bound and last_t < stale):
+                self._events.pop(umo, None)
 
     async def _poll_all(self):
         """轮询全部 hjnu 绑定，记录历史、触发预警（合并同会话）。
@@ -652,8 +784,11 @@ class ElectricCore:
                 self._remember_raw(umo, results)
                 any_ok = False
                 any_expired = False
+                any_failed = False
                 for kind, result in results.items():
                     if result is None:
+                        # 连响应都没有（网络/学校无响应）——属于「失败」形态
+                        any_failed = True
                         continue
                     if result.ok and result.value is not None:
                         any_ok = True
@@ -669,13 +804,18 @@ class ElectricCore:
                         )
                     elif result.session_expired:
                         any_expired = True
-                if results:
-                    if any_ok:
-                        cycle_ok = True
-                    elif any_expired:
-                        cycle_expired = True
                     else:
-                        cycle_net_fail = True
+                        # 学校有响应但没给余额（5xx / 非 JSON / 网络失败）
+                        any_failed = True
+                # 三种形态分开统计，不再互斥：
+                # 纯 91001 连环 = 凭证真过期；91001 与 5xx/超时混杂 = 学校整体
+                # 发癫（闸 3 的判据）。互斥写法会把混杂形态误当成「纯 91001」。
+                if any_ok:
+                    cycle_ok = True
+                if any_expired:
+                    cycle_expired = True
+                if any_failed:
+                    cycle_net_fail = True
                 outcomes.append((umo, binding, any_ok, any_expired))
                 self._record_event(
                     umo, "poll", f"轮询：{self._binding_label(binding)}"
@@ -696,7 +836,9 @@ class ElectricCore:
                 self._touch_credential(expired=True)
             elif cycle_net_fail:
                 self._touch_credential(net_fail=True)
-            self._update_expired_strikes(ok=cycle_ok, expired=cycle_expired)
+            self._update_expired_strikes(
+                ok=cycle_ok, expired=cycle_expired, net_fail=cycle_net_fail
+            )
         except OSError as e:
             logger.error(f"[{PLUGIN_NAME}] 凭证状态落盘失败：{e}")
         confirmed = self._credential_dead_confirmed()
@@ -934,7 +1076,8 @@ class ElectricCore:
                 )
                 return
             logger.warning(
-                f"[{PLUGIN_NAME}] 凭证连续 {self.CREDENTIAL_CONFIRM_STRIKES} 次被拒，判定失效"
+                f"[{PLUGIN_NAME}] 凭证连续 {self.CREDENTIAL_CONFIRM_STRIKES} 次被拒"
+                f"且连续被拒满 {self._confirm_span_minutes():g} 分钟，判定失效"
             )
             bindings = self.store.data.get("bindings", {})
             for umo, binding in list(bindings.items()):
@@ -945,6 +1088,8 @@ class ElectricCore:
                     logger.error(f"[{PLUGIN_NAME}] 保活失效处理 {umo} 失败：{e!r}")
         except QueryError as e:
             self._touch_credential(net_fail=True)
+            # 混杂形态：连续被拒期间出现 5xx/超时 → 学校整体发癫，窗口加倍
+            self._update_expired_strikes(net_fail=True)
             logger.error(
                 f"[{PLUGIN_NAME}] 保活探测失败（学校/网络抖动，不改凭证状态）：{e}"
             )
@@ -1031,11 +1176,34 @@ class ElectricCore:
             lines.append(line)
         return "\n".join(lines) if len(lines) > 1 else None
 
+    # 每会话事件流容量：/电费 日志 上限 100 条、自检尾部 5 条，
+    # 60 条足够两者的常规查看；会话数也有上限（超出挤掉最久没动静的）。
+    EVENTS_PER_SESSION: ClassVar[int] = 60
+    EVENTS_MAX_SESSIONS: ClassVar[int] = 120
+
     def _record_event(self, umo: str, kind: str, text: str) -> None:
-        """记录一条事件到内存事件流。"""
-        self._events.append(
-            {"t": time.time(), "kind": kind, "text": text, "umo": umo}
-        )
+        """记录一条事件到**本会话**的事件流（按 umo 隔离，互不挤占）。"""
+        bucket = self._events.setdefault(umo, deque(maxlen=self.EVENTS_PER_SESSION))
+        bucket.append({"t": time.time(), "kind": kind, "text": text, "umo": umo})
+        self._cap_event_sessions()
+
+    def _cap_event_sessions(self) -> None:
+        """事件流会话数超上限时挤掉最久没动静的（防长期运行内存缓涨）。
+
+        正常增长由 _sweep_memory 兜（无绑定 + 7 天没动静整桶清），这里是
+        防御性硬顶：短时间被大量一次性会话（webchat 调试、广告号私聊）
+        刷事件时也不至于无界增长。
+        """
+        overflow = len(self._events) - self.EVENTS_MAX_SESSIONS
+        if overflow <= 0:
+            return
+
+        def _last_activity(umo: str) -> float:
+            bucket = self._events.get(umo)
+            return float(bucket[-1].get("t", 0) or 0) if bucket else 0.0
+
+        for umo in sorted(self._events, key=_last_activity)[:overflow]:
+            self._events.pop(umo, None)
 
     # ================= 绑定向导：选择器与渲染器 =================
     # /电费 指令与 LLM 工具共用同一套选择/渲染逻辑，避免两处实现漂移。
@@ -2354,8 +2522,10 @@ class ElectricCore:
 
         results = await self._fetch_fees(binding)
         self._remember_raw(umo, results)
-        suspect = self._credential_suspect_mode()
-        state = self._credential_state(results, suspect=suspect)
+        mode = self._credential_display_mode()
+        suspect = mode == "suspect"
+        unconfirmed = mode == "unconfirmed"
+        state = self._credential_state(results, suspect=suspect, unconfirmed=unconfirmed)
         fees = self._fee_bindings(binding)
         lines = [
             f"🔎 电费自检 {label}",
@@ -2366,6 +2536,9 @@ class ElectricCore:
             + "、".join(self._fee_name(kind) for kind in fees)
             + "）",
         ]
+        observation = self._credential_observation_line()
+        if observation:
+            lines.append(observation)
         mute_line = self._mute_line(umo)
         if mute_line:
             lines.append(mute_line)
@@ -2373,10 +2546,10 @@ class ElectricCore:
         lines.extend(
             "  " + line
             for line in self._format_fee_results(
-                results, include_missing=True, suspect=suspect
+                results, include_missing=True, suspect=suspect, unconfirmed=unconfirmed
             )
         )
-        events = [ev for ev in self._events if ev.get("umo") == umo][-5:]
+        events = list(self._events.get(umo, ()))[-5:]
         lines.append("最近事件（新→旧）：")
         if not events:
             lines.append("  （暂无事件）")
@@ -2669,7 +2842,7 @@ class ElectricCore:
             count = 20
         count = max(1, min(100, count))
         tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
-        events = [ev for ev in self._events if ev.get("umo") == umo][-count:]
+        events = list(self._events.get(umo, ()))[-count:]
         lines = [f"📋 事件流（最近 {len(events)} 条）："]
         if not events:
             lines.append("  （暂无事件）")
