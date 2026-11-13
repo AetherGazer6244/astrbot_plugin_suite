@@ -141,11 +141,16 @@ class Store:
         return out
 
     def set_subscription(self, umo: str, games, dynamics: bool) -> None:
-        self.data["subscriptions"][umo] = {
+        prev = self.data["subscriptions"].get(umo)
+        sub: dict = {
             "games": sorted(set(games)),
             "dynamics": bool(dynamics),
             "updated_at": time.time(),
         }
+        # 静音状态是会话自己的选择，不能因为一次订阅操作就被无声冲掉
+        if isinstance(prev, dict) and prev.get("muted_until"):
+            sub["muted_until"] = prev["muted_until"]
+        self.data["subscriptions"][umo] = sub
 
     def del_subscription(self, umo: str) -> bool:
         return self.data["subscriptions"].pop(umo, None) is not None

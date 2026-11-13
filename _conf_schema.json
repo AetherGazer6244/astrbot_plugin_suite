@@ -237,6 +237,12 @@
         "type": "int",
         "default": 5
       },
+      "query_cache_seconds": {
+        "description": "查询结果缓存秒数",
+        "type": "int",
+        "default": 60,
+        "hint": "60 秒内的重复查询直接吃缓存不再打官网（1999 官网有风控，连问容易被拦）。填 0 关闭缓存，每次都真打官网。轮询每轮都会刷新缓存，命中即最新不超过一个轮询周期。"
+      },
       "code_ttl_hint_hours": {
         "description": "兑换码默认有效期（小时）",
         "type": "int",
