@@ -16,7 +16,15 @@ from pathlib import Path
 
 logger = logging.getLogger("astrbot.plugin.games_monitor")
 
-DEFAULT_DATA: dict = {"seen": {}, "subscriptions": {}, "codes": {}}
+DEFAULT_DATA: dict = {
+    "seen": {},
+    "subscriptions": {},
+    "codes": {},
+    # v1.2.0：AI 摘要落盘（key → {ck, text, at}），重启后不用等下一轮重新生成
+    "digests": {},
+    # v1.2.0：广播失败的兑换码队列（key → [records]），补发前过滤已过期
+    "pending_codes": {},
+}
 # 每个来源最多记多少条已读 ID。10 分钟一轮、一天 144 轮，记 400 条足够，
 # 再多只是让存储文件无限膨胀。
 MAX_SEEN_PER_SOURCE = 400
@@ -48,6 +56,8 @@ class Store:
         if isinstance(data, dict) and isinstance(data.get("seen"), dict):
             data.setdefault("subscriptions", {})
             data.setdefault("codes", {})
+            data.setdefault("digests", {})
+            data.setdefault("pending_codes", {})
             self.data = data
         else:
             logger.error("存储文件结构异常（seen 不是 dict），已按空数据起步：%s", self.path)
@@ -160,6 +170,69 @@ class Store:
             return float(self.subscription(umo).get("muted_until") or 0) > time.time()
         except (TypeError, ValueError):
             return False
+
+    def set_muted(self, umo: str, hours: float) -> float:
+        """静音本会话推送 N 小时。
+
+        没订阅也允许静音：条目建成空订阅（games=[] 不影响任何广播匹配），
+        用户之后订阅时 set_subscription 会保留 muted_until（v1.1.2 语义）。
+        返回静音截止时间戳。
+        """
+        sub = self.data["subscriptions"].get(umo)
+        if not isinstance(sub, dict):
+            sub = {"games": [], "dynamics": False, "updated_at": time.time()}
+            self.data["subscriptions"][umo] = sub
+        until = time.time() + max(0.0, float(hours)) * 3600.0
+        sub["muted_until"] = until
+        return until
+
+    def clear_muted(self, umo: str) -> float:
+        """解除静音。返回原截止时间戳（本来就没静音返回 0）。"""
+        sub = self.data["subscriptions"].get(umo)
+        if isinstance(sub, dict):
+            prev = sub.pop("muted_until", None)
+            try:
+                return float(prev or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def muted_until(self, umo: str) -> float:
+        try:
+            return float(self.subscription(umo).get("muted_until") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # ---------- AI 摘要落盘（v1.2.0） ----------
+
+    def set_digest(self, key: str, ck, text: str) -> None:
+        self.data["digests"][key] = {
+            "ck": [str(x) for x in ck],
+            "text": str(text),
+            "at": time.time(),
+        }
+
+    def all_digests(self) -> dict:
+        """全部落盘摘要，形状与内存 _digest_cache 一致：key → (ck元组, text)。"""
+        out: dict = {}
+        for key, raw in self.data["digests"].items():
+            if isinstance(raw, dict) and raw.get("text") and isinstance(raw.get("ck"), list):
+                out[str(key)] = (tuple(str(x) for x in raw["ck"]), str(raw["text"]))
+        return out
+
+    # ---------- 兑换码广播失败队列（v1.2.0 落盘） ----------
+
+    def pending_codes(self, key: str) -> list[dict]:
+        raw = self.data["pending_codes"].get(key)
+        if not isinstance(raw, list):
+            return []
+        return [r for r in raw if isinstance(r, dict)]
+
+    def set_pending_codes(self, key: str, records: list[dict]) -> None:
+        if records:
+            self.data["pending_codes"][key] = list(records)
+        else:
+            self.data["pending_codes"].pop(key, None)
 
     # ---------- 兑换码 ----------
 

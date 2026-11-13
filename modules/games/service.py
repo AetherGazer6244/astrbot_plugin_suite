@@ -30,11 +30,14 @@ try:
     from . import webui
     from .cache import TTLCache
     from .codes import merge_into, scan_dynamics, scan_item
+    from .digest import DigestMixin
     from .formatting import (
         codes_text,
         dynamics_text,
+        format_mute_until,
         gacha_lines,
         help_text,
+        mute_text,
         news_text,
         push_text,
         scope_text,
@@ -68,19 +71,19 @@ try:
     from .summarizer import (
         DIGEST_WAIT_SECONDS,
         PUSH_DIGEST_WAIT_SECONDS,
-        build_digest_prompt,
-        cache_key,
-        summarize,
     )
 except ImportError:  # 兜底：被以非包方式加载时
     import webui  # type: ignore
     from cache import TTLCache  # type: ignore
     from codes import merge_into, scan_dynamics, scan_item  # type: ignore
+    from digest import DigestMixin  # type: ignore
     from formatting import (  # type: ignore
         codes_text,
         dynamics_text,
+        format_mute_until,
         gacha_lines,
         help_text,
+        mute_text,
         news_text,
         push_text,
         scope_text,
@@ -114,9 +117,6 @@ except ImportError:  # 兜底：被以非包方式加载时
     from summarizer import (  # type: ignore
         DIGEST_WAIT_SECONDS,
         PUSH_DIGEST_WAIT_SECONDS,
-        build_digest_prompt,
-        cache_key,
-        summarize,
     )
 
 try:
@@ -153,6 +153,17 @@ GROUP_SUBSCRIBE_DENIED = (
     "或者让群管理员来开。"
 )
 
+# 群聊静音闸门文案（与订阅同款语义：群推送是公共体验，只有管理员能改）
+GROUP_MUTE_DENIED = (
+    "🔒 群聊里只有管理员能调整推送静音。\n"
+    "想静音的话，私聊机器人发送 /游戏 静音；"
+    "或者让群管理员来操作。"
+)
+
+# 静音时长上限（小时）：7 天。跟电费插件 ALERT_MUTE_MAX_HOURS 同一口径——
+# 静音是「别打扰」不是「永远别告诉我」，可逆且要有上限防手滑填 99999。
+MAX_MUTE_HOURS = 168
+
 UNKNOWN_GAME_HINT = (
     "没认出是哪个游戏。可以用：重返未来 / 1999 / 九九 / 明日方舟 / 方舟 / ak。"
 )
@@ -176,7 +187,9 @@ AI_GAMES_HINT = (
 )
 
 
-class GamesCore:
+class GamesCore(DigestMixin):
+    """DigestMixin 提供 AI 要点摘要的生成/缓存/落盘（见 digest.py）。"""
+
     def __init__(self, context: Context, config: AstrBotConfig):
         # 套件版不再继承 Star（super().__init__ 已随转换移除），context 自行保存
         self.context = context
@@ -186,17 +199,17 @@ class GamesCore:
         self.bili = None
         self.scheduler: AsyncIOScheduler | None = None
         self._tasks: list[asyncio.Task] = []
-        # AI 摘要缓存：游戏 key → (公告 id 元组, 摘要文本)。内存态，重启清空，
-        # 下一轮轮询（≤10 分钟）就会重新预热。
+        # AI 摘要缓存：游戏 key → (公告 id 元组, 摘要文本)。v1.2.0 起落盘
+        # （store 的 digests 组），重启时 _restore_digests 装回，公告列表没变
+        # 就直接命中，不用等下一轮轮询重新生成。
         self._digest_cache: dict[str, tuple[tuple, str]] = {}
         # 每个游戏最多一个在途生成任务：查询/推送/轮询三方共用，绝不双调 LLM
         self._digest_tasks: dict[str, asyncio.Task] = {}
         # 数据源名 → {"fail": 连续失败次数, "until": 退避截止时间戳}
         self._failure_backoff: dict[str, dict] = {}
-        # 广播失败的兑换码：key → [records]。下轮轮询先补发，送达才清——
-        # 套件红线「发送成功才记账，失败下轮重发」：入库归入库，广播归广播，
-        # 推送失败不能让用户永远错过一个码（内存态，重启后码仍在库里可查）。
-        self._pending_code_push: dict[str, list[dict]] = {}
+        # 广播失败的兑换码队列 v1.2.0 起持久化在 store 的 pending_codes 组
+        # （内存 dict 退役）：推送失败也要扛住重启，否则又是「码在库里但永远
+        # 不再广播」的 v1.1.1 回归。补发前过滤已过期的码。
         # 查询缓存：news:{key} / cat:{key}:{cat} → 条目列表。60 秒内的重复
         # 提问直接吃缓存，不再打官网（1999 的 EdgeOne 风控扛不住连问）。
         # 轮询每轮都会刷新 news 缓存，命中即最新不超过一个轮询周期。
@@ -213,6 +226,7 @@ class GamesCore:
             keep_days=self._cfg_int("history_keep_days", 30),
         )
         self.store.prune()
+        self._restore_digests()
         self._build_sources()
 
         self.scheduler = AsyncIOScheduler()
@@ -287,7 +301,7 @@ class GamesCore:
             except OSError as e:
                 logger.error(f"[{PLUGIN_NAME}] 退出保存失败：{e}")
         self._failure_backoff.clear()
-        self._pending_code_push.clear()
+        # pending 队列与摘要在 store 里持久化，terminate 不清（重启后继续补发/命中）
 
     # ================= 配置 =================
 
@@ -412,103 +426,6 @@ class GamesCore:
         self._note_success(name)
         return result
 
-    # ================= AI 要点摘要（后台预生成，前台秒取） =================
-    # 架构（用户拍板）：AI 在后台实时分析——轮询发现公告变化就调 LLM 写缓存，
-    # 前台 /游戏 与推送只读缓存。生成失败不缓存，下一轮自动重试。
-
-    def _digest_enabled(self) -> bool:
-        return self._cfg_bool("ai_summary_enabled", True)
-
-    def _digest_max_items(self) -> int:
-        return max(3, min(20, self._cfg_int("ai_summary_max_items", 8)))
-
-    def _digest_provider(self):
-        """后台生成统一用宿主默认配置档当前选中的对话模型。
-
-        后台任务没有会话上下文，会话级偏好模型在这里不适用；
-        想换摘要模型 = 在 WebUI 默认配置档里切换模型。
-        """
-        getter = getattr(self.context, "get_using_provider", None)
-        if not callable(getter):
-            return None
-        try:
-            return getter(None)
-        except Exception as e:
-            logger.warning(f"[{PLUGIN_NAME}] 取对话模型失败：{e!r}")
-            return None
-
-    def _digest_of(self, key: str, items: list) -> str | None:
-        """读缓存：id 元组完全一致才算命中，公告列表变了就当没有。
-
-        ⚠️ 排序必须在这里做（而不是指望调用方排过）：轮询传进来的 items 是
-        数据源原始顺序，视图/推送传的是时间倒序——真跑渲染抓到过两边 key
-        不一致导致缓存永远 miss、LLM 被重复调用一倍的 bug。
-        """
-        entry = self._digest_cache.get(key)
-        if not entry:
-            return None
-        picked = sorted(items, key=lambda i: i.published, reverse=True)
-        picked = picked[: self._digest_max_items()]
-        return entry[1] if entry[0] == cache_key(picked) else None
-
-    def _spawn_digest(self, key: str, items: list) -> None:
-        """后台生成。每游戏同时最多一个在途任务，重复触发直接复用。"""
-        existing = self._digest_tasks.get(key)
-        if existing and not existing.done():
-            return
-        self._digest_tasks[key] = asyncio.create_task(self._generate_digest(key, items))
-
-    def _maybe_refresh_digest(self, key: str, items: list) -> None:
-        """轮询钩子：缓存过期（公告变化/首启/上次失败）就 spawn 后台生成，绝不阻塞轮询。"""
-        if not self._digest_enabled() or not items:
-            return
-        if self._digest_of(key, items) is not None:
-            return
-        self._spawn_digest(key, items)
-
-    async def _generate_digest(self, key: str, items: list) -> None:
-        picked = sorted(items, key=lambda i: i.published, reverse=True)
-        picked = picked[: self._digest_max_items()]
-        provider = self._digest_provider()
-        if provider is None:
-            logger.info(f"[{PLUGIN_NAME}] AI 摘要跳过：没有可用的对话模型")
-            return
-        prompt = build_digest_prompt(game_display(key), picked)
-        try:
-            digest = await summarize(provider, prompt)
-        except Exception as e:
-            # 失败不缓存 → 下一轮轮询自动重试；前台/推送各自兜底
-            logger.warning(f"[{PLUGIN_NAME}] {game_display(key)} AI 摘要生成失败：{e!r}")
-            return
-        self._digest_cache[key] = (cache_key(picked), digest)
-        logger.info(f"[{PLUGIN_NAME}] {game_display(key)} AI 摘要已更新（{len(picked)} 条公告）")
-
-    async def _ensure_digest(self, key: str, items: list, wait_seconds: float) -> str | None:
-        """查询/推送路径：缓存命中直接回；没命中就在途任务上有限时等待。
-
-        等不到（超时/失败/没配模型）返回 None，调用方回退原始列表。
-        超时不取消生成任务本身（shield）——它继续在后台跑完写缓存，
-        用户「稍后再发一次 /游戏」就能拿到。
-        """
-        if not self._digest_enabled():
-            return None
-        picked = sorted(items, key=lambda i: i.published, reverse=True)
-        picked = picked[: self._digest_max_items()]
-        cached = self._digest_of(key, picked)
-        if cached is not None:
-            return cached
-        self._spawn_digest(key, picked)
-        task = self._digest_tasks.get(key)
-        if task is None:
-            return None
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            return None
-        except Exception:
-            return None
-        return self._digest_of(key, picked)
-
     # ================= 指令 =================
 
     async def cmd_games(self, event: AstrMessageEvent):
@@ -519,6 +436,9 @@ class GamesCore:
             return
         if sub == "订阅":
             yield event.plain_result(await self._handle_subscribe(event, rest))
+            return
+        if sub == "静音":
+            yield event.plain_result(await self._handle_mute(event, rest))
             return
         if sub == "总结":
             # 显式要摘要——与默认视图同路（默认就是 AI 摘要），留给肌肉记忆
@@ -831,6 +751,60 @@ class GamesCore:
     # 防御性硬顶，超出丢最老的（码库里有，/游戏 兑换 还能查到）。
     MAX_PENDING_CODES_PER_GAME = 20
 
+    # ================= 静音（v1.2.0） =================
+
+    async def _handle_mute(self, event, rest: str) -> str:
+        """推送静音：无参=看状态；N=静音 N 小时；0/解除=恢复。群聊仅管理员。
+
+        静音的作用面 = 三类推送全体（新公告/新动态/新兑换码），查询不受影响；
+        静音期间错过的新公告不补发（v1.1.1 起 mark_seen 语义），解除后
+        想看直接 /游戏——「别打扰」不是「替你攒着」。
+        """
+        if not self.store:
+            return "存储还没初始化，稍后再试。"
+        umo = event.unified_msg_origin
+        rest = (rest or "").strip()
+
+        if not rest:
+            # 纯状态查询不设闸门：谁都能看本群现在静音到几点
+            until = self.store.muted_until(umo)
+            if until <= time.time():
+                return mute_text(
+                    "本会话推送未静音",
+                    "静音一段时间：/游戏 静音 2（小时）\n恢复推送：/游戏 静音 解除",
+                )
+            return mute_text(
+                f"推送已静音至 {format_mute_until(until)}",
+                "期间新公告/动态/兑换码都不会推送（查询不受影响）。\n恢复推送：/游戏 静音 解除",
+            )
+
+        if not self._is_private(event) and not self._is_admin(event):
+            return GROUP_MUTE_DENIED
+
+        if is_subscribe_off(rest) or rest in ("0", "解除", "恢复"):
+            prev = self.store.clear_muted(umo)
+            if prev > 0:
+                self.store.save(force=True)
+                return mute_text("已恢复推送", "有新公告/动态/兑换码会继续提醒你。")
+            return mute_text("本来就没静音", "推送一直是开着的。")
+
+        # N 小时（支持「2」「2小时」「2.5」）
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:小时|h|H|hours?)?", rest)
+        if not m:
+            return (
+                f"没认出「{rest}」。用法：/游戏 静音 2（静音 2 小时）、"
+                "/游戏 静音 解除（恢复）、/游戏 静音（看状态）。"
+            )
+        hours = float(m.group(1))
+        # 「0」在上面已按解除处理，到这里必然是正数
+        hours = min(hours, MAX_MUTE_HOURS)
+        until = self.store.set_muted(umo, hours)
+        self.store.save(force=True)
+        return mute_text(
+            f"已静音 {hours:g} 小时（至 {format_mute_until(until)}）",
+            "期间新公告/动态/兑换码都不推送，查询不受影响。\n提前恢复：/游戏 静音 解除",
+        )
+
     async def _poll_news(self) -> None:
         for key in self._enabled_games():
             if not self.store:
@@ -913,23 +887,39 @@ class GamesCore:
                 )
 
     async def _push_codes(self, key: str, new_codes: list[dict]) -> None:
-        """广播新码 + 补发上轮失败的；仍失败的留在 pending，下轮再来。
+        """广播新码 + 补发上轮失败的；仍失败的留在 store 的 pending 队列，下轮再来。
 
         红线「发送成功才记账」：入库（absorb）只是登记，广播送达才算数——
         旧实现入库后推送失败就再也不推，用户永远错过这个码。
+
+        v1.2.0 起 pending 队列持久化（store 的 pending_codes 组）：推送失败
+        也要扛住重启，否则崩溃后码就「在库里但永远不再广播」。补发前过滤
+        已过期的码（过期了再推就是骚扰）。队列变化才写盘且用 force：
+        广播失败是稀有事件，但丢了就是永久漏推，去抖窗口吞不得；
+        无事发生时零 IO（本方法每轮轮询都会被调）。
         """
         if not self.store:
             return
+        now = time.time()
+        stored = self.store.pending_codes(key)
+
+        def _alive(rec: dict) -> bool:
+            try:
+                return float(rec.get("expire_at") or 0) > now
+            except (TypeError, ValueError):
+                return True  # 过期时间认不出按未过期处理：宁推勿漏
+
+        pending = [r for r in stored if _alive(r)]
+        expired_dropped = len(pending) != len(stored)
         codes = list(new_codes)
-        pending = self._pending_code_push.get(key, [])
         if pending:
             seen = {str(r.get("code")) for r in codes}
             codes.extend(r for r in pending if str(r.get("code")) not in seen)
         failed = await self._broadcast_codes(key, codes)
-        if failed:
-            self._pending_code_push[key] = failed[: self.MAX_PENDING_CODES_PER_GAME]
-        else:
-            self._pending_code_push.pop(key, None)
+        after = failed[: self.MAX_PENDING_CODES_PER_GAME]
+        if expired_dropped or after != pending:
+            self.store.set_pending_codes(key, after)
+            self.store.save(force=True)
 
     async def _broadcast_codes(self, key: str, codes: list[dict]) -> list[dict]:
         """把码广播给订阅了该游戏的会话。返回**未成功送达**的码。

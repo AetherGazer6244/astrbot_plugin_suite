@@ -5,6 +5,7 @@
 列表方向 bug——渲染口径必须能被单测钉住）。
 """
 
+import datetime
 import time
 
 try:
@@ -201,6 +202,7 @@ def help_text(enabled, poll_min: int, dynamics_min: int, push_on: bool) -> str:
             "  /游戏 <游戏名> 兑换   兑换码（别名：码/兑换码）",
             "  /游戏 <游戏名> 版本   版本更新与维护公告",
             "  /游戏 订阅 <游戏|全部|关闭>   开关本会话推送（群内仅管理员）",
+            "  /游戏 静音 [小时]   暂时不推送（无参看状态；0/解除=恢复；群内仅管理员）",
             "  /游戏 帮助       本说明",
             "",
             "游戏名可以写：重返未来/1999/九九/重返、明日方舟/方舟/ak。",
@@ -211,6 +213,17 @@ def help_text(enabled, poll_min: int, dynamics_min: int, push_on: bool) -> str:
 
 def subscribe_text(action: str, detail: str) -> str:
     return f"🔔 {action}\n{detail}"
+
+
+def mute_text(action: str, detail: str) -> str:
+    return f"🔕 {action}\n{detail}"
+
+
+def format_mute_until(until: float) -> str:
+    """静音截止时间戳 → 「MM-DD HH:MM」。纯函数便于单测。"""
+    if until <= 0:
+        return ""
+    return datetime.datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
 
 
 def scope_text(subs) -> str:
