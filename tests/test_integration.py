@@ -605,16 +605,16 @@ def test_broadcast_failure_requeues_and_retries(tmp_path):
     p = _plugin(tmp_path, config={"push_enabled": True}, items=[item], ctx=ctx)
     p.store.set_subscription(PRIVATE_UMO, ["re1999"], True)
     asyncio.run(p._poll_news())
-    # 入库照常（广播失败不影响码库），广播尝试过但没送达 → 码进 pending
+    # 入库照常（广播失败不影响码库），广播尝试过但没送达 → 码进 pending（持久化）
     assert [c["code"] for c in p.store.codes("re1999")] == ["NEWCOD1234"]
-    assert [str(r["code"]) for r in p._pending_code_push["re1999"]] == ["NEWCOD1234"]
+    assert [str(r["code"]) for r in p.store.pending_codes("re1999")] == ["NEWCOD1234"]
     assert len([t for _u, t in ctx.sent if "新兑换码" in t]) == 1  # 尝试了但 FakeContext 拒收
 
     # 下轮发送恢复：同一条公告再拉（码已在库，absorb 返回空新码），pending 补发
     ctx.ok = True
     asyncio.run(p._poll_news())
     assert len([t for _u, t in ctx.sent if "新兑换码" in t]) == 2  # 补发成功
-    assert "re1999" not in p._pending_code_push
+    assert p.store.pending_codes("re1999") == []
 
 
 def test_broadcast_no_subscriber_clears_pending(tmp_path):
@@ -626,15 +626,18 @@ def test_broadcast_no_subscriber_clears_pending(tmp_path):
     ctx = FakeContext()
     p = _plugin(tmp_path, config={"push_enabled": True}, items=[], ctx=ctx)
     p.store.set_subscription(PRIVATE_UMO, ["re1999"], True)
-    p._pending_code_push["re1999"] = [
-        {"code": "OLD12345", "sources": ["bilibili"], "url": "u",
-         "expire_at": time.time() + 3600, "found_at": time.time()},
-    ]
+    p.store.set_pending_codes(
+        "re1999",
+        [
+            {"code": "OLD12345", "sources": ["bilibili"], "url": "u",
+             "expire_at": time.time() + 3600, "found_at": time.time()},
+        ],
+    )
     # 订阅者存在但正在静音
     p.store.data["subscriptions"][PRIVATE_UMO]["muted_until"] = time.time() + 600
     asyncio.run(p._push_codes("re1999", []))
     assert ctx.sent == []
-    assert "re1999" not in p._pending_code_push
+    assert p.store.pending_codes("re1999") == []
 
 
 def test_poll_isolates_failing_source(tmp_path, monkeypatch):

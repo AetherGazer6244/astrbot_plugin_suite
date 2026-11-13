@@ -85,7 +85,6 @@ def make_games_plugin(config=None, store=None, sources=None, bili=None, context=
     plugin._digest_cache = {}
     plugin._digest_tasks = {}
     plugin._failure_backoff = {}
-    plugin._pending_code_push = {}
     plugin._qr_at = 0.0
     from astrbot_plugin_suite.modules.games.cache import TTLCache
 

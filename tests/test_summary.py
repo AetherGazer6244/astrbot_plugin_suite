@@ -14,7 +14,12 @@ import pytest
 from astrbot_plugin_suite.modules.games import service as M
 from astrbot_plugin_suite.modules.games.providers import NewsItem
 from astrbot_plugin_suite.modules.games.storage import Store
-from astrbot_plugin_suite.modules.games.summarizer import wash
+from astrbot_plugin_suite.modules.games.summarizer import (
+    build_digest_prompt,
+    cache_key,
+    summarize,
+    wash,
+)
 from conftest import PRIVATE_UMO, FakeContext, FakeProvider, FakeSource, make_games_plugin
 
 
@@ -48,7 +53,7 @@ def _plugin(tmp_path, items=None, provider=None, config=None, ctx=None, sources=
 def _prewarm(p, key="re1999"):
     """直接跑完一次生成，把缓存填上（模拟后台已完成）。"""
     items = asyncio.run(p._latest(key, 8))
-    p._digest_cache[key] = (M.cache_key(items[: p._digest_max_items()]), "- 已缓存要点")
+    p._digest_cache[key] = (cache_key(items[: p._digest_max_items()]), "- 已缓存要点")
 
 
 # ==================== summarizer 纯函数 ====================
@@ -57,7 +62,7 @@ def _prewarm(p, key="re1999"):
 def test_build_digest_prompt_strips_urls_and_truncates():
     long = "很长的正文。" * 200
     items = [_news("1", "维护公告", content=f"详情 https://example.com/a\n{long}")]
-    prompt = M.build_digest_prompt("重返未来：1999", items)
+    prompt = build_digest_prompt("重返未来：1999", items)
     assert "https://" not in prompt
     # 单条公告被截断，prompt 不会无限膨胀
     assert len(prompt) < 3000 + 500
@@ -75,18 +80,18 @@ def test_wash_strips_urls_and_blank_lines():
 def test_summarize_empty_text_raises():
     provider = FakeProvider(text="   ")
     with pytest.raises(ValueError):
-        asyncio.run(M.summarize(provider, "prompt"))
+        asyncio.run(summarize(provider, "prompt"))
 
 
 def test_summarize_timeout():
     provider = FakeProvider(text="慢", delay=0.2)
     with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(M.summarize(provider, "prompt", timeout=0.01))
+        asyncio.run(summarize(provider, "prompt", timeout=0.01))
 
 
 def test_summarize_returns_completion_text():
     provider = FakeProvider(text="- 要点")
-    assert asyncio.run(M.summarize(provider, "p")) == "- 要点"
+    assert asyncio.run(summarize(provider, "p")) == "- 要点"
 
 
 # ==================== 生成与缓存 ====================
