@@ -28,7 +28,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 
-from .base import SourceError
+from .base import ARCHIVE_SOURCE_BILI_VIDEO, NewsItem, SourceError
 from .http_client import HttpClient
 
 logger = logging.getLogger("astrbot.plugin.games_monitor")
@@ -37,6 +37,7 @@ API = "https://api.bilibili.com"
 PASSPORT = "https://passport.bilibili.com"
 
 DYNAMIC_URL = f"{API}/x/polymer/web-dynamic/v1/feed/space"
+ARC_SEARCH_URL = f"{API}/x/space/wbi/arc/search"
 SPI_URL = f"{API}/x/frontend/finger/spi"
 NAV_URL = f"{API}/x/web-interface/nav"
 QRCODE_GENERATE_URL = f"{PASSPORT}/x/passport-login/web/qrcode/generate"
@@ -283,8 +284,83 @@ class BilibiliDynamics:
             await asyncio.sleep(EMPTY_RETRY_DELAY * (attempt + 1))
         return []
 
+    async def space_videos(self, uid: str, game: str, limit: int = 5) -> list[NewsItem]:
+        """拉官方号的最新**视频投稿**（v1.3.0 第四渠道）。
+
+        PV/联动预告常常只发视频不发动态，动态流里看不到——投稿列表补这个盲区。
+        wbi 签名复用动态那套（_ensure_identity）。这个接口比动态 feed 更容易
+        吃风控，调用方必须逐源隔离（try/except），失败不能拖累动态轮询。
+        """
+        await self._ensure_identity()
+        params = {
+            "mid": str(uid),
+            "ps": str(max(1, min(30, int(limit)))),
+            "tid": "0",
+            "pn": "1",
+            "keyword": "",
+            "order": "pubdate",
+            "platform": "web",
+            "web_location": "1550101",
+            "order_avoided": "true",
+        }
+        query, w_rid = sign_params(params, self._wbi_key)
+        url = f"{ARC_SEARCH_URL}?{query}&w_rid={w_rid}"
+        payload = await self.client.request_json(
+            "GET", url, cookies=self._cookies(),
+            headers={"Referer": f"https://space.bilibili.com/{uid}/video"},
+        )
+        return parse_videos(payload, game, limit=limit)
+
     async def close(self) -> None:
         await self.client.close()
+
+
+def parse_videos(payload: dict, game: str, limit: int = 0) -> list[NewsItem]:
+    """把投稿列表响应解析成 NewsItem（纯函数）。
+
+    响应 data.list.vlist[]: {aid, bvid, title, description, created, ...}，
+    created 是 Unix 秒。item_id 用 aid（数字主键，稳定）；url 用 bvid 拼的
+    视频页（B站现在两种都认，bvid 是分享链接的标准形态）。
+    """
+    if not isinstance(payload, dict):
+        raise SourceError("B站投稿列表响应结构异常")
+    code = payload.get("code")
+    if code == RISK_BLOCKED:
+        raise SourceError("B站风控拦截（-352）：投稿列表拉取失败")
+    if code != 0:
+        raise SourceError(f"B站投稿接口返回 code={code} message={payload.get('message')}")
+    data = payload.get("data")
+    vlist = (data or {}).get("list", {}).get("vlist") if isinstance(data, dict) else None
+    items: list[NewsItem] = []
+    for raw in vlist or []:
+        if not isinstance(raw, dict):
+            continue
+        aid = str(raw.get("aid") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        if not aid or not title:
+            continue
+        bvid = str(raw.get("bvid") or "").strip()
+        desc = str(raw.get("description") or "").strip()
+        try:
+            created = float(raw.get("created") or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        items.append(
+            NewsItem(
+                game=game,
+                item_id=aid,
+                title=title,
+                category="视频",
+                published=created,
+                url=f"https://www.bilibili.com/video/{bvid or f'av{aid}'}",
+                summary=desc[:80],
+                content=desc,
+                source=ARCHIVE_SOURCE_BILI_VIDEO,
+            )
+        )
+        if limit and len(items) >= limit:
+            break
+    return items
 
 
 class BilibiliLogin:

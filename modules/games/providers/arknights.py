@@ -90,5 +90,22 @@ class ArknightsSource:
         )
         return parse_items(payload, limit=limit)
 
+    async def fetch_page(self, category: str, page: int = 1) -> list[NewsItem]:
+        """拉指定页的原始条目（档案库深抓/回填用）。
+
+        页大小官网写死 6 条（2026-11-14 实测：limit/size/pageSize 参数全部
+        不生效），ANNOUNCEMENT 共 918 条 = 153 页。翻过末页返回空列表——
+        调用方拿「空页」当停止信号，不用解析 total。
+        """
+        param = CATEGORY_PARAM.get(category)
+        if not param:
+            raise SourceError(f"方舟没有分类「{category}」")
+        payload = await self.client.request_json(
+            "GET",
+            f"{BASE_URL}{API_PATH}",
+            params={"category": param, "page": max(1, int(page))},
+        )
+        return parse_items(payload, limit=0)
+
     async def close(self) -> None:
         await self.client.close()

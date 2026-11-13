@@ -159,13 +159,13 @@ def test_llm_tool_names_use_plugin_prefix():
             )
 
 
-def test_llm_tools_are_exactly_three():
+def test_llm_tools_are_exactly_four():
     tools = sorted(
         m.__games_llm_tool__
         for _n, m in _members()
         if hasattr(m, "__games_llm_tool__")
     )
-    assert tools == ["games_codes", "games_dynamics", "games_news"]
+    assert tools == ["games_codes", "games_dynamics", "games_history", "games_news"]
 
 
 def test_llm_tools_return_str_not_yield():

@@ -92,7 +92,7 @@ def electric():
     PLUGIN_NAME,
     "Cecilian",
     "功能套件：宿舍电费监控 + 游戏资讯聚合 + 备忘录提醒，一个插件装齐，模块可按配置档开关",
-    "1.2.0",
+    "1.3.0",
 )
 class SuitePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -776,6 +776,30 @@ class SuitePlugin(Star):
         if not self._module_enabled("games", umo):
             return "游戏资讯模块已关闭，请联系管理员在插件配置或 /套件 里开启。"
         return await self.games.tool_games_dynamics(event, game)
+
+    @filter.llm_tool(name="games_history")
+    async def tool_games_history(
+        self,
+        event: AstrMessageEvent,
+        game: str = "",
+        keyword: str = "",
+        days: float = 90,
+    ) -> str:
+        """查游戏历史公告档案（本地库，支持关键词与时间范围，最早约一年）。
+
+        用户翻历史时用这个：「9月的维护公告说了啥」「上个月的卡池是哪个」
+        「去年联动是什么时候」。档案含两家官网公告/活动/新闻全文与 B站动态，
+        查询走本地库，官网挂了也能答。查**最新**资讯请用 games_news。
+
+        Args:
+            game(string): 游戏名。重返未来/1999/九九/重返 或 明日方舟/方舟/ak。留空表示两游戏都要。
+            keyword(string): 关键词，对标题+正文匹配，例如 维护/卡池/联动/补偿。留空不过滤。
+            days(number): 往前查多少天，默认 90，最大 365。
+        """
+        umo = getattr(event, "unified_msg_origin", None)
+        if not self._module_enabled("games", umo):
+            return "游戏资讯模块已关闭，请联系管理员在插件配置或 /套件 里开启。"
+        return await self.games.tool_games_history(event, game, keyword, days)
 
     # ================= memo：备忘录待办与定时提醒 =================
 

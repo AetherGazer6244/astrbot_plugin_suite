@@ -255,6 +255,30 @@
         "default": 30,
         "hint": "控制存储文件大小；不影响已推送内容的展示。"
       },
+      "archive_enabled": {
+        "description": "启用资讯档案库",
+        "type": "bool",
+        "default": true,
+        "hint": "全量抓取历史公告落本地（首次启动后台回填，方舟约 918 条 + 1999 约 100 条）。查询改走本地库：秒回、官网挂了也能查。关闭后回退「现打官网」的旧模式。"
+      },
+      "archive_keep_days": {
+        "description": "档案保留天数",
+        "type": "int",
+        "default": 365,
+        "hint": "超期条目自动清理。"
+      },
+      "archive_max_per_game": {
+        "description": "每游戏档案条数硬顶",
+        "type": "int",
+        "default": 1500,
+        "hint": "超出丢最老的，防止档案无限膨胀。"
+      },
+      "archive_deep_minutes": {
+        "description": "档案深抓间隔（分钟）",
+        "type": "int",
+        "default": 60,
+        "hint": "每小时从游标继续往历史深处翻几页，翻到已归档的整页就停。不用改。"
+      },
       "request_timeout_seconds": {
         "description": "请求超时（秒）",
         "type": "int",

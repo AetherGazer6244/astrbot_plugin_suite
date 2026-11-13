@@ -315,7 +315,11 @@ def test_poll_spawns_digest_and_push_falls_back(tmp_path):
     asyncio.run(p._poll_news())
     # 推送正文：等了 45s 上限内生成完成（0.05s 假延迟），拿到摘要
     assert "资讯要点" in ctx.sent[0][1]
-    assert "新公告" not in ctx.sent[0][1]  # 摘要模式下不附原始列表
+    # v1.3.0 真实度②：摘要下附原文标题行（刻意的口径变化——旧断言
+    # 「标题不出现」已反转）；但兜底头「有新公告」不应出现（走了摘要模式）
+    assert "摘要依据原文" in ctx.sent[0][1]
+    assert "新公告" in ctx.sent[0][1]
+    assert "有新公告" not in ctx.sent[0][1]
     # setup 时已记 '2' 已读，推送成功补记 '1'
     assert p.store.seen_ids("news:re1999") == {"1", "2"}
 
@@ -412,7 +416,8 @@ def test_initialize_registers_jobs_and_warms_up_even_without_push(tmp_path, monk
         return warmed
 
     warmed = asyncio.run(go())
-    assert sorted(sched.jobs) == ["_poll_dynamics", "_poll_news"]
+    # v1.3.0：档案库启用时多注册 deep_archive job
+    assert sorted(sched.jobs) == ["_deep_archive", "_poll_dynamics", "_poll_news"]
     # 预热完成：摘要已入缓存
     assert "re1999" in warmed
     # terminate 清空在途任务与缓存

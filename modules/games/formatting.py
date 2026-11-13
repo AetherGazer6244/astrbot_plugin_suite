@@ -24,7 +24,10 @@ EMPTY_CODE_TEXT = "没有兑换码QWQ"
 EMPTY_NEWS_TEXT = "暂时没有查到相关资讯，稍后再试试。"
 EMPTY_DYNAMIC_TEXT = "该官方号暂时没有可读取的动态。"
 
-CATEGORY_ICON = {"公告": "📢", "活动": "🎉", "新闻": "📰", "资讯": "📄"}
+CATEGORY_ICON = {"公告": "📢", "活动": "🎉", "新闻": "📰", "资讯": "📄", "视频": "🎬"}
+# 渠道图标（v1.3.0 真实度标注）：非官网渠道的条目在列表里标明来源渠道名，
+# 用户一眼看出「这条是官网公告还是B站搬运」。官网条目 category 已足够。
+SOURCE_ICON = {"B站动态": "📺", "B站视频": "🎬"}
 
 
 def fmt_date(ts: float, with_time: bool = True) -> str:
@@ -71,11 +74,21 @@ def one_line(text: str, limit: int = 80) -> str:
 
 
 def news_lines(items, with_summary: bool = True) -> list[str]:
-    """资讯列表渲染。每行：分类图标 + 标题 + 日期（不含链接，用户决策）。"""
+    """资讯列表渲染。每行：分类图标 + 标题 + 日期（不含链接，用户决策）。
+
+    非官网渠道（B站动态/视频）的条目把渠道名标进行首（真实度标注）：
+    「📺 [B站动态·动态] …」太啰嗦，直接换渠道图标 + [渠道·分类]。
+    """
     lines = []
     for item in items:
-        icon = CATEGORY_ICON.get(item.category, "📄")
-        head = f"{icon} [{item.category}] {one_line(item.title, 40)}"
+        src = getattr(item, "source", "") or ""
+        if src in SOURCE_ICON:
+            icon = SOURCE_ICON[src]
+            label = f"{src}"
+        else:
+            icon = CATEGORY_ICON.get(item.category, "📄")
+            label = item.category
+        head = f"{icon} [{label}] {one_line(item.title, 40)}"
         date = fmt_date(item.published)
         lines.append(head)
         if with_summary and item.summary:
