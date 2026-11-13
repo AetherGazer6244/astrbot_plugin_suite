@@ -125,5 +125,29 @@ class Re1999Source:
         )
         return parse_items(payload, limit=limit)
 
+    async def fetch_page(self, category: str, page: int = 1) -> list[NewsItem]:
+        """拉指定页的原始条目（档案库深抓/回填用）。
+
+        ⚠️ 1999 的正文在列表接口里（content 字段，单条约 7KB），一页 8 条
+        就是 ~56KB——深抓必须串行小步走，别把 EdgeOne 惹毛（TLS 指纹稍异
+        直接 code=5001）。翻过末页 pageData 为空列表，调用方拿它当停止信号。
+        """
+        param = CATEGORY_PARAM.get(category)
+        if param is None:
+            raise SourceError(f"1999 没有分类「{category}」")
+        payload = await self.client.request_json(
+            "POST",
+            f"{BASE_URL}{API_PATH}",
+            json_body={
+                "id": "",
+                "informationType": param,
+                "current": max(1, int(page)),
+                "pageSize": 8,
+                "isTop": "",
+            },
+            headers=BROWSER_HEADERS,
+        )
+        return parse_items(payload, limit=0)
+
     async def close(self) -> None:
         await self.client.close()

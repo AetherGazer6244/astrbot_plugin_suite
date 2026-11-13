@@ -70,7 +70,8 @@ def make_plugin(config=None, store=None, hjnu=None, context=None, scheduler=None
     return plugin
 
 
-def make_games_plugin(config=None, store=None, sources=None, bili=None, context=None, scheduler=None):
+def make_games_plugin(config=None, store=None, sources=None, bili=None, context=None,
+                      scheduler=None, archive=None):
     """games 模块统一脚手架（原 make_plugin，套件里改名避免与电费工厂撞名）。"""
     from astrbot_plugin_suite.modules.games import service as _service
 
@@ -78,6 +79,7 @@ def make_games_plugin(config=None, store=None, sources=None, bili=None, context=
     plugin.context = context
     plugin.config = _wrapped_config(config, "games")
     plugin.store = store
+    plugin.archive = archive  # v1.3.0：档案库（默认 None = 未启用）
     plugin.sources = sources if sources is not None else {}
     plugin.bili = bili
     plugin.scheduler = scheduler
@@ -210,6 +212,13 @@ class FakeSource:
         if self.error:
             raise self.error
         return list(self.items)
+
+    async def fetch_page(self, category, page=1):
+        """深抓翻页替身：默认空页（= 翻过末端），回填立即结束不产生噪声。"""
+        self.calls.append((f"{category}#p{page}", 0))
+        if self.error:
+            raise self.error
+        return []
 
     async def close(self):
         self.closed = True

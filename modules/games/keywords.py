@@ -5,6 +5,7 @@
 """
 
 import re
+from datetime import datetime
 
 try:
     from .providers.base import fold
@@ -149,27 +150,63 @@ def _atoms(m) -> tuple:
     return tuple(groups[:5]), tuple(groups[5:10])
 
 
+def _atom_ts(atom: tuple, year_hint: int) -> float | None:
+    """把捕获组还原成 Unix 秒。年份缺失用 year_hint 补。非法日期（2月30日等）返回 None。"""
+    year, month, day, hour, minute = atom
+    try:
+        dt = datetime(int(year) if year else year_hint, int(month), int(day))
+        if hour and minute:
+            dt = dt.replace(hour=int(hour), minute=int(minute))
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+# 时间段合理性窗口（真实度校验，v1.3.0）：解析出来的时间落在
+# [发布-30天, 发布+2年] 之外就丢弃——发布前 30 天的宽容度涵盖「预告稿」，
+# +2 年封顶拦住「把『10月16日』配错年份」这类解析事故，宁可少给不给错的。
+RANGE_PAST_GRACE_SECONDS = 30 * 86400
+RANGE_FUTURE_CAP_SECONDS = 730 * 86400
+
+
+def _plausible(ts: float | None, published: float) -> bool:
+    if ts is None:
+        return False  # 非法日期（2月30日）不输出
+    if published <= 0:
+        return True  # 没有发布时间可对照时不过滤（旧数据兼容）
+    return (published - RANGE_PAST_GRACE_SECONDS) <= ts <= (published + RANGE_FUTURE_CAP_SECONDS)
+
+
 def extract_time_ranges(
     text: str,
     limit: int = 2,
     require_cue: bool = True,
     cues: tuple[str, ...] | None = None,
+    published: float = 0.0,
 ) -> list[str]:
     """从正文抽出时间段，返回形如 "10月16日 16:00 - 10月30日 03:59" 的列表。
 
     cues 决定认哪些引导词：卡池视图传 ACTIVITY_CUES（别把停服时间当活动时间），
     版本视图传 MAINTENANCE_CUES，不传则两组都认。
     require_cue=False 时不要求引导词，供已经确定场景的调用方使用。
+    published 是公告发布时刻：超出合理性窗口的解析结果直接丢弃
+    （真实度校验，v1.3.0）——错配年份的时间宁可不给，不能硬塞给用户。
     """
     if not text:
         return []
     cue_set = cues if cues is not None else CUE_WORDS
     blob = str(text)
+    year_hint = datetime.fromtimestamp(published).year if published > 0 else datetime.now().year
     found: list[str] = []
     for m in RANGE_RE.finditer(blob):
         if require_cue and not _near_cue(blob, m.start(), m.end(), cue_set):
             continue
         left, right = _atoms(m)
+        if published > 0 and not (
+            _plausible(_atom_ts(left, year_hint), published)
+            and _plausible(_atom_ts(right, year_hint), published)
+        ):
+            continue
         rendered = f"{_fmt(left)} - {_fmt(right)}"
         if rendered not in found:
             found.append(rendered)
@@ -179,7 +216,10 @@ def extract_time_ranges(
     for m in SAMEDAY_RANGE_RE.finditer(blob):
         if require_cue and not _near_cue(blob, m.start(), m.end(), cue_set):
             continue
-        head = _fmt(tuple(m.groups()[:5]))
+        head_atom = tuple(m.groups()[:5])
+        if published > 0 and not _plausible(_atom_ts(head_atom, year_hint), published):
+            continue
+        head = _fmt(head_atom)
         rendered = f"{head} - {int(m.group(6)):02d}:{m.group(7)}"
         if rendered not in found:
             found.append(rendered)
@@ -191,7 +231,10 @@ def extract_time_ranges(
     for m in SINGLE_RE.finditer(blob):
         if require_cue and not _near_cue(blob, m.start(), m.end(), cue_set):
             continue
-        rendered = _fmt(tuple(m.groups()))
+        atom = tuple(m.groups())
+        if published > 0 and not _plausible(_atom_ts(atom, year_hint), published):
+            continue
+        rendered = _fmt(atom)
         if rendered not in found:
             found.append(rendered)
         if len(found) >= limit:

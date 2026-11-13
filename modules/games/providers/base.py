@@ -51,12 +51,22 @@ def fold(text: str) -> str:
     return "".join(ch for ch in s if ch not in " \t\r\n-_·・,.，。!！?？")
 
 
+# 资讯渠道名（v1.3.0 真实度标注）：档案条目与列表渲染标明每条信息从哪来。
+# 聊天输出不放裸链接（v1.1.0 用户决策），渠道名就是来源标注。
+ARCHIVE_SOURCE_OFFICIAL = "官网"
+ARCHIVE_SOURCE_BILI_DYN = "B站动态"
+ARCHIVE_SOURCE_BILI_VIDEO = "B站视频"
+
+
 @dataclass(frozen=True)
 class NewsItem:
     """一条官方资讯。
 
     content 存正文原文（1999 是 HTML 全文，方舟用官网给的 brief），
     summary 是给列表展示的一行短摘要。
+    source 是**渠道名**（官网 / B站动态 / B站视频，v1.3.0 起档案条目回填
+    此字段）：真实度标注用——用户能看出每条信息从哪个渠道来，模型编造
+    无所遁形。官网直拉的条目默认空串（category 已表达官网栏目）。
     """
 
     game: str
@@ -67,6 +77,7 @@ class NewsItem:
     url: str
     summary: str = ""
     content: str = ""
+    source: str = ""
 
     @property
     def text_blob(self) -> str:
