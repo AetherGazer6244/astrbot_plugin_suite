@@ -28,6 +28,7 @@ from astrbot.api.star import Context
 
 try:
     from . import webui
+    from .cache import TTLCache
     from .codes import merge_into, scan_dynamics, scan_item
     from .formatting import (
         codes_text,
@@ -73,6 +74,7 @@ try:
     )
 except ImportError:  # 兜底：被以非包方式加载时
     import webui  # type: ignore
+    from cache import TTLCache  # type: ignore
     from codes import merge_into, scan_dynamics, scan_item  # type: ignore
     from formatting import (  # type: ignore
         codes_text,
@@ -195,6 +197,10 @@ class GamesCore:
         # 套件红线「发送成功才记账，失败下轮重发」：入库归入库，广播归广播，
         # 推送失败不能让用户永远错过一个码（内存态，重启后码仍在库里可查）。
         self._pending_code_push: dict[str, list[dict]] = {}
+        # 查询缓存：news:{key} / cat:{key}:{cat} → 条目列表。60 秒内的重复
+        # 提问直接吃缓存，不再打官网（1999 的 EdgeOne 风控扛不住连问）。
+        # 轮询每轮都会刷新 news 缓存，命中即最新不超过一个轮询周期。
+        self._news_cache = TTLCache(ttl_seconds=float(self._cfg_int("query_cache_seconds", 60)))
         # 最近一次生成二维码的时间，用于本地判过期（省一趟必然失败的请求）
         self._qr_at: float = 0.0
 
@@ -262,6 +268,7 @@ class GamesCore:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._digest_cache.clear()
+        self._news_cache.clear()
         for source in list(self.sources.values()):
             try:
                 await source.close()
@@ -367,6 +374,28 @@ class GamesCore:
         if source is None:
             raise SourceError(f"{game_display(key)} 数据源未启用")
         return await source.by_category(category, limit=limit)
+
+    # ---------- 查询缓存包装 ----------
+
+    async def _latest_cached(self, key: str, limit: int):
+        """带缓存的最新列表。失败直接向上抛（_safe_call 捕获），不会写入缓存。"""
+        ck = f"news:{key}"
+        hit = self._news_cache.get(ck, min_items=limit)
+        if hit is not None:
+            return hit[:limit]
+        items = await self._latest(key, limit)
+        self._news_cache.put(ck, items)
+        return items
+
+    async def _category_cached(self, key: str, category: str, limit: int):
+        """带缓存的分类列表。卡池/版本视图与 AI 工具共用同一份。"""
+        ck = f"cat:{key}:{category}"
+        hit = self._news_cache.get(ck, min_items=limit)
+        if hit is not None:
+            return hit[:limit]
+        items = await self._category(key, category, limit=limit)
+        self._news_cache.put(ck, items)
+        return items
 
     async def _safe_call(self, name: str, coro_factory):
         """统一的数据源调用包装：失败记日志+退避并返回 None，绝不让一条源拖垮整条指令。"""
@@ -569,8 +598,15 @@ class GamesCore:
         # 真跑渲染抓到的第二个 key 不一致 bug。展示仍按 push_n 截断。
         fetch_n = max(push_n, self._digest_max_items())
         blocks, errors, fallback = [], [], False
-        for key in games:
-            items = await self._safe_call(f"news:{key}", lambda k=key, n=fetch_n: self._latest(k, n))
+        # 两游戏并行拉（各自走缓存 + 退避，互不拖累）：串行时一个源慢 2 秒，
+        # 总延迟就是 4 秒起
+        async def _fetch(key: str):
+            return await self._safe_call(
+                f"news:{key}", lambda k=key, n=fetch_n: self._latest_cached(k, n)
+            )
+
+        fetched = await asyncio.gather(*(_fetch(k) for k in games))
+        for key, items in zip(games, fetched, strict=True):
             if items is None:
                 errors.append(game_display(key))
                 continue
@@ -601,10 +637,14 @@ class GamesCore:
                 else UNKNOWN_GAME_HINT
             )
         blocks, errors = [], []
-        for key in games:
-            items = await self._safe_call(
-                f"news:{key}", lambda k=key: self._category(k, "最新", limit=30)
+        # 两游戏并行拉（缓存同前）：卡池关键词本就稀疏，别让串行请求雪上加霜
+        async def _fetch_cat(key: str, cat: str):
+            return await self._safe_call(
+                f"news:{key}", lambda k=key, c=cat: self._category_cached(k, c, limit=30)
             )
+
+        fetched = await asyncio.gather(*(_fetch_cat(k, "最新") for k in games))
+        for key, items in zip(games, fetched, strict=True):
             if items is None:
                 errors.append(game_display(key))
                 continue
@@ -649,10 +689,13 @@ class GamesCore:
                 else UNKNOWN_GAME_HINT
             )
         blocks, errors = [], []
-        for key in games:
-            items = await self._safe_call(
-                f"news:{key}", lambda k=key: self._category(k, "公告", limit=30)
+        async def _fetch_ver(key: str):
+            return await self._safe_call(
+                f"news:{key}", lambda k=key: self._category_cached(k, "公告", limit=30)
             )
+
+        fetched = await asyncio.gather(*(_fetch_ver(k) for k in games))
+        for key, items in zip(games, fetched, strict=True):
             if items is None:
                 errors.append(game_display(key))
                 continue
@@ -797,7 +840,7 @@ class GamesCore:
             try:
                 limit = max(self._max_push() * 3, 15)
                 items = await self._safe_call(
-                    f"news:{key}", lambda k=key, n=limit: self._latest(k, n)
+                    f"news:{key}", lambda k=key, n=limit: self._latest_cached(k, n)
                 )
                 if not items:
                     continue
@@ -854,6 +897,8 @@ class GamesCore:
                 delivery_failed = False
                 for umo, sub in wanted.items():
                     if key not in (sub.get("games") or []):
+                        continue
+                    if self.store.is_muted(umo):
                         continue
                     if not await self._send(umo, f"🆕 {body}"):
                         delivery_failed = True
@@ -970,7 +1015,13 @@ class GamesCore:
         before = {str(r.get("code")) for r in merged}
         merged = merge_into(merged, hits, now, ttl)
         self.store.set_codes(key, merged)
-        return [r for r in merged if str(r.get("code")) not in before]
+        new = [r for r in merged if str(r.get("code")) not in before]
+        if new:
+            # 新码入库即刻持久化且 force：去抖窗口内的第二次 save 会被吞，
+            # 崩溃/重启就丢码（本测试当场抓到）；新码是稀有事件，多一次
+            # fsync 毫无压力。没有新码就不写（扫正文每轮都跑，别浪费 IO）。
+            self.store.save(force=True)
+        return new
 
     async def _absorb_dyn_codes(self, key: str, dyns) -> list[dict]:
         if not self.store:
@@ -984,7 +1035,10 @@ class GamesCore:
         before = {str(r.get("code")) for r in merged}
         merged = merge_into(merged, hits, now, ttl)
         self.store.set_codes(key, merged)
-        return [r for r in merged if str(r.get("code")) not in before]
+        new = [r for r in merged if str(r.get("code")) not in before]
+        if new:
+            self.store.save(force=True)
+        return new
 
     # ================= AI 幕后提示 =================
 
@@ -1070,10 +1124,14 @@ class GamesCore:
 
         out, errors = [], []
         limit = self._max_push()
-        for key in games:
-            items = await self._safe_call(
-                f"news:{key}", lambda k=key: self._category(k, cat, limit=30)
+
+        async def _fetch(key: str):
+            return await self._safe_call(
+                f"news:{key}", lambda k=key, c=cat: self._category_cached(k, c, limit=30)
             )
+
+        fetched = await asyncio.gather(*(_fetch(k) for k in games))
+        for key, items in zip(games, fetched, strict=True):
             if items is None:
                 errors.append(game_display(key))
                 continue
