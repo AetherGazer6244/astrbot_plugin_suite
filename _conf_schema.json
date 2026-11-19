@@ -350,5 +350,23 @@
         "hint": "命中「备忘/待办/提醒我」等关键词才注入，不命中不花 token。"
       }
     }
+  },
+  "quick": {
+    "type": "object",
+    "description": "快捷数字菜单（/菜单 → 回数字直达）",
+    "items": {
+      "quick_menu_enabled": {
+        "description": "启用快捷数字菜单",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 /菜单 不再出菜单，数字回复也不再接管（照旧走 AI 对话）。"
+      },
+      "quick_menu_ttl_seconds": {
+        "description": "菜单有效期（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "发送 /菜单 后多久内回数字仍然生效（30~3600 秒）。过期后数字消息照旧走 AI，不劫持日常聊天。"
+      }
+    }
   }
 }

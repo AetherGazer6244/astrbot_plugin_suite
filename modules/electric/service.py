@@ -2745,36 +2745,45 @@ class ElectricCore:
 
     async def cmd_query(self, event: AstrMessageEvent):
         """立即查询绑定的房间余额"""
-        umo = event.unified_msg_origin
+        yield event.plain_result(await self._query_text(event.unified_msg_origin))
+
+    async def _query_text(self, umo: str) -> str:
+        """查询余额并渲染成文本。
+
+        指令（/电费 查询）与快捷数字菜单共用同一段逻辑——文案逐字一致，
+        两处不会出现「指令说一套、菜单说另一套」。
+        """
         binding = self.store.get_binding(umo)
         if not binding:
-            yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
-            return
+            return "尚未绑定房间。发送 /电费 绑定 开始。"
         fee_lines, ok_count = await self._query_and_record(umo, binding)
         total = len(self._fee_bindings(binding))
         if not fee_lines:
-            yield event.plain_result(
+            self._record_event(umo, "error", "查询失败：网络异常")
+            return (
                 f"⚡ {self._binding_label(binding)}\n❌ 查询失败（网络异常或数据源不可用）。"
             )
-            self._record_event(umo, "error", "查询失败：网络异常")
-            return
         self.store.save(force=True)
         self._record_event(
             umo,
             "query",
             f"查询成功 {ok_count}/{total} 项（{self._binding_label(binding)}）",
         )
-        yield event.plain_result(
-            f"⚡ {self._binding_label(binding)}\n" + "\n".join(fee_lines)
-        )
+        return f"⚡ {self._binding_label(binding)}\n" + "\n".join(fee_lines)
 
     async def cmd_history(self, event: AstrMessageEvent, n: str | None = None):
         """查看最近 n 天每日余额快照（默认 7 天，最多 60 天）"""
         umo = event.unified_msg_origin
+        yield event.plain_result(await self._history_text(umo, n))
+
+    async def _history_text(self, umo: str, n: str | None = None) -> str:
+        """渲染历史快照文本。
+
+        指令（/电费 历史）与快捷数字菜单共用同一段逻辑——文案逐字一致。
+        """
         binding = self.store.get_binding(umo)
         if not binding:
-            yield event.plain_result("尚未绑定房间。发送 /电费 绑定 开始。")
-            return
+            return "尚未绑定房间。发送 /电费 绑定 开始。"
         try:
             days = int(n) if n else 7
         except ValueError:
@@ -2783,8 +2792,7 @@ class ElectricCore:
         tz = self._resolve_tz(self._cfg("daily_timezone", "Asia/Shanghai"))
         histories = binding.get("history_by_fee") or {}
         if not histories:
-            yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
-            return
+            return "暂无历史数据。下次轮询后会自动记录。"
         lines = [f"📈 {self._binding_label(binding)} 历史（近 {days} 天）"]
         any_data = False
         for kind in ("ac", "elec"):
@@ -2828,10 +2836,9 @@ class ElectricCore:
                     f"最低：{stats['min']:.2f} / 最高：{stats['max']:.2f}{extra}"
                 )
         if not any_data:
-            yield event.plain_result("暂无历史数据。下次轮询后会自动记录。")
-            return
+            return "暂无历史数据。下次轮询后会自动记录。"
         self._record_event(umo, "info", f"查看历史（近 {days} 天）")
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
 
     async def cmd_log(self, event: AstrMessageEvent, n: str | None = None):
         """查看最近 n 条事件 + 最近一次原始返回（默认 20，最多 100）"""
@@ -2863,6 +2870,29 @@ class ElectricCore:
         else:
             lines.append("\n🔍 最近一次原始返回：（无，先发 /电费 查询 触发一次）")
         yield event.plain_result("\n".join(lines))
+
+    # ================= 快捷数字菜单 =================
+
+    def quick_actions(self) -> list[tuple[str, Any]]:
+        """本模块供快捷数字菜单使用的条目：[(标题, 执行器)]。
+
+        执行器签名 async (event) -> str，返回给用户看的文本。套件根
+        main.py 按模块开关过滤后交给 quick 模块布防编号。
+        """
+        return [
+            ("查电费余额", self._quick_balance),
+            ("电费历史（近 7 天）", self._quick_history),
+            ("电费自检", self._quick_check),
+        ]
+
+    async def _quick_balance(self, event: AstrMessageEvent) -> str:
+        return await self._query_text(event.unified_msg_origin)
+
+    async def _quick_history(self, event: AstrMessageEvent) -> str:
+        return await self._history_text(event.unified_msg_origin, None)
+
+    async def _quick_check(self, event: AstrMessageEvent) -> str:
+        return await self._check_report(event.unified_msg_origin)
 
     # ================= 指令：凭证 =================
 

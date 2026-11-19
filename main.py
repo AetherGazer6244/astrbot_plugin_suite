@@ -17,6 +17,7 @@ modules/<模块>/service.py 及其子模块里。
 
 import json
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -42,12 +43,14 @@ try:
     from .modules.electric import service as electric_service
     from .modules.games import service as games_service
     from .modules.memo import service as memo_service
+    from .modules.quick import service as quick_service
 except ImportError:  # 以仓库根为工作目录直接导入（测试/脚本）
     from modules import migrate
     from modules.config_view import SectionConfig
     from modules.electric import service as electric_service
     from modules.games import service as games_service
     from modules.memo import service as memo_service
+    from modules.quick import service as quick_service
 
 PLUGIN_NAME = "astrbot_plugin_suite"
 
@@ -91,8 +94,8 @@ def electric():
 @register(
     PLUGIN_NAME,
     "Cecilian",
-    "功能套件：宿舍电费监控 + 游戏资讯聚合 + 备忘录提醒，一个插件装齐，模块可按配置档开关",
-    "1.3.0",
+    "功能套件：宿舍电费监控 + 游戏资讯聚合 + 备忘录提醒 + 快捷数字菜单，一个插件装齐，模块可按配置档开关",
+    "1.4.0",
 )
 class SuitePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -107,6 +110,8 @@ class SuitePlugin(Star):
         self.memo = memo_service.MemoCore(
             context, SectionConfig(config, "memo")
         )
+        # 快捷数字菜单：跨模块统一菜单（/菜单 → 回数字直达）
+        self.quick = quick_service.QuickCore(context, SectionConfig(config, "quick"))
         # 档内模块覆盖缓存：mtime 变了才重读 profiles.json
         self._profiles: dict[str, dict[str, bool]] = {}
         self._profiles_mtime: float = -1.0
@@ -348,6 +353,11 @@ class SuitePlugin(Star):
                 await core.terminate()
             except Exception:
                 logger.exception(f"[{PLUGIN_NAME}] 模块 {name} 退出清理失败")
+        # 快捷菜单是纯内存布防状态（QuickCore.terminate 为同步方法）
+        try:
+            self.quick.terminate()
+        except Exception:
+            logger.exception(f"[{PLUGIN_NAME}] 快捷菜单退出清理失败")
         self._profiles = {}
         self._profiles_mtime = -1.0
 
@@ -364,6 +374,110 @@ class SuitePlugin(Star):
         if not self._module_enabled("electric", umo):
             return
         return await self.electric.on_user_replied_code(event)
+
+    # ================= 快捷数字菜单 =================
+
+    @staticmethod
+    def _event_text(event) -> str:
+        """取消息正文（宿主优先 get_message_str，兜底 message_str）。"""
+        getter = getattr(event, "get_message_str", None)
+        if callable(getter):
+            try:
+                return str(getter() or "")
+            except Exception:
+                return ""
+        return str(getattr(event, "message_str", "") or "")
+
+    @staticmethod
+    def _event_sender(event) -> str:
+        """取发送者 id（取不到就空串——空串表示不做发送者隔离）。"""
+        getter = getattr(event, "get_sender_id", None)
+        if callable(getter):
+            try:
+                return str(getter() or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _quick_entries(self, umo: str | None) -> list[tuple[str, Any]]:
+        """按模块开关（全局 + 本配置档）过滤出快捷菜单条目。
+
+        编号由 quick 模块按顺序连续分配——被关掉的模块条目不出现，
+        剩下的重新连号（不会出现「1、2、4」这种空洞）。
+        """
+        entries: list[tuple[str, Any]] = []
+        for name, core in (
+            ("electric", self.electric),
+            ("games", self.games),
+            ("memo", self.memo),
+        ):
+            if not self._module_enabled(name, umo):
+                continue
+            for label, handler in core.quick_actions():
+                entries.append((label, self._guard_quick(name, handler)))
+        return entries
+
+    def _guard_quick(self, name: str, handler):
+        """执行前再查一次模块开关：布防之后模块被关掉也不该继续跑。"""
+
+        async def guarded(event):
+            umo = getattr(event, "unified_msg_origin", None)
+            if not self._module_enabled(name, umo):
+                return f"该模块已关闭，{name} 相关操作暂时不可用。"
+            return await handler(event)
+
+        return guarded
+
+    @filter.command("菜单", alias={"快捷", "quick"})
+    async def cmd_menu(self, event: AstrMessageEvent):
+        """快捷数字菜单：/菜单 后直接回数字直达（仅私聊，5 分钟内有效）"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not event.is_private_chat():
+            yield event.plain_result(
+                "🔒 快捷菜单请私聊使用（群里回数字不生效，避免误触）。"
+            )
+            return
+        if not self.quick.enabled():
+            yield event.plain_result("快捷菜单已在插件配置里关闭。")
+            return
+        entries = self._quick_entries(umo)
+        if not entries:
+            yield event.plain_result("当前没有可用的快捷功能（相关模块都被关闭了）。")
+            return
+        items = self.quick.arm(umo, self._event_sender(event), entries)
+        yield event.plain_result(self.quick.menu_text(items))
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def on_quick_digit_reply(self, event: AstrMessageEvent):
+        """快捷菜单的数字回复：命中就执行，没命中就彻底不管。
+
+        只在「私聊 + 已 /菜单 布防 + 未过期 + 纯单个数字」时接管；
+        其余情况（日常聊天里的数字、多位数确认码）一律不碰——消息
+        照旧走 AI，绝不劫持正常对话。
+        """
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo or not event.is_private_chat():
+            return
+        if not self.quick.enabled():
+            return
+        pick = self.quick.take(umo, self._event_sender(event), self._event_text(event))
+        if pick is None:
+            # 没布防 / 不是纯数字 / 发送者不符 → 不接管
+            return
+        if pick.kind == "cancel":
+            yield event.plain_result("已取消快捷菜单。")
+            return
+        if pick.kind == "invalid":
+            yield event.plain_result(
+                f"❓ 没有 {pick.digit} 这个选项。\n\n" + self.quick.menu_text(pick.menu)
+            )
+            return
+        try:
+            text = await pick.item.handler(event)
+        except Exception as e:
+            logger.exception(f"[{PLUGIN_NAME}] 快捷菜单执行失败：{e!r}")
+            text = "这个功能执行失败了，稍后再试。"
+        yield event.plain_result(f"{text}\n\n（菜单仍有效，回复 0 取消）")
 
     @_llm_request_hook()
     async def inject_electric_hint(self, event: AstrMessageEvent, req) -> None:
