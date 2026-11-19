@@ -721,6 +721,25 @@ class GamesCore(DigestMixin):
             )
         return text or "暂时没有查到相关资讯，稍后再试试。"
 
+    # ================= 快捷数字菜单 =================
+
+    def quick_actions(self) -> list[tuple[str, Any]]:
+        """本模块供快捷数字菜单使用的条目：[(标题, 执行器)]。
+
+        执行器签名 async (event) -> str，返回给用户看的文本。套件根
+        main.py 按模块开关过滤后交给 quick 模块布防编号。
+        """
+        return [
+            ("游戏资讯要点", self._quick_news),
+            ("游戏兑换码", self._quick_codes),
+        ]
+
+    async def _quick_news(self, event: AstrMessageEvent) -> str:
+        return await self._news_view("")
+
+    async def _quick_codes(self, event: AstrMessageEvent) -> str:
+        return await self._codes_view("")
+
     # ================= 订阅 =================
 
     def _is_private(self, event) -> bool:

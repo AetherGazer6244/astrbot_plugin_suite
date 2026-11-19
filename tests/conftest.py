@@ -108,6 +108,17 @@ def make_memo_plugin(config=None, store=None, context=None, scheduler=None):
     return plugin
 
 
+def make_quick_plugin(config=None, context=None):
+    """quick 模块统一脚手架：__new__ 绕过 __init__ 补全字段。"""
+    from astrbot_plugin_suite.modules.quick import service as _service
+
+    plugin = _service.QuickCore.__new__(_service.QuickCore)
+    plugin.context = context
+    plugin.config = _wrapped_config(config, "quick")
+    plugin._armed = {}
+    return plugin
+
+
 def load_fixture(name: str) -> dict:
     """读取 tests/fixtures 下的真实抓取样本。"""
     import json
@@ -317,13 +328,19 @@ def _install_stubs() -> None:
         return deco
 
     def _plain_command_kind(name):
-        """裸指令按注册名归模块（套件 main.py 里三类裸指令共用 filter.command）。"""
+        """裸指令按注册名归模块（套件 main.py 里三类裸指令共用 filter.command）。
+
+        ⚠️ 新增裸指令必须在这里登记对应 kind：默认落 "dorm" 会把新指令
+        混进电费的指令集，直接打破 test_dorm_command_names_locked。
+        """
         if name == "游戏":
             return "games"
         if name == "备忘":
             return "memo"
         if name == "套件":
             return "suite"
+        if name == "菜单":
+            return "quick"
         return "dorm"
 
     def _llm_tool_kind(name):

@@ -45,7 +45,13 @@ def test_every_command_decorator_sits_on_cmd_named_function():
 
 def test_every_cmd_function_carries_command_metadata():
     """套件里 cmd_* 家族 = 电费 16 条 + /游戏 + /套件，都必须带指令标记。"""
-    kinds = ("__dorm_command__", "__games_command__", "__memo_command__", "__suite_command__")
+    kinds = (
+        "__dorm_command__",
+        "__games_command__",
+        "__memo_command__",
+        "__suite_command__",
+        "__quick_command__",
+    )
     for name, member in _members():
         if name.startswith("cmd_") and asyncio.iscoroutinefunction(
             getattr(member, "__func__", member)

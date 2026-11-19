@@ -13,7 +13,7 @@ v1.1.0 三次「只有真跑才看得见的列表方向/页码/重复渲染」�
 
 用法：
     python tools/smoke.py                 # 全量
-    python tools/smoke.py --module memo   # 只跑一个模块（electric/games/memo）
+    python tools/smoke.py --module memo   # 只跑一个模块（electric/games/memo/quick）
 """
 
 import asyncio
@@ -294,6 +294,80 @@ async def memo_main(tmp):
     await plugin.terminate()
 
 
+# ================= quick：快捷数字菜单（真代码路径） =================
+
+
+async def quick_main(tmp):
+    """快捷数字菜单真跑：/菜单 出菜单 → 回数字直达。
+
+    走的是套件根 main.py 的包装器（真实注册面），打印出来的就是
+    聊天窗口里用户看到的原文。
+    """
+    from astrbot_plugin_suite.main import SuitePlugin
+
+    plugin = SuitePlugin(
+        FakeContext(),
+        StubAstrBotConfig({"modules": {}, "electric": {}, "games": {}, "memo": {}}),
+    )
+    # 电费侧接上假学校源，让「查电费余额」真的能出数
+    plugin.electric.store = ElectricStore(tmp / "quick_electric.json")
+    plugin.electric.hjnu = FakeHjnu()
+    # 绑一个房间（与 electric_main 走同一条绑定链路的产物）
+    plugin.electric.store.set_binding(
+        UMO,
+        {
+            "room_label": "校本部/春雪楼2/8层/A-8-17",
+            "fees": {
+                "ac": {
+                    "provider": "hjnu",
+                    "params": {"aid": AC_AID},
+                },
+                "elec": {
+                    "provider": "hjnu",
+                    "params": {"aid": ELEC_AID},
+                },
+            },
+            "history_by_fee": {},
+        },
+    )
+
+    async def run_cmd(text):
+        ev = FakeEvent(text, umo=UMO)
+        async for _chunk in plugin.cmd_menu(ev):
+            pass
+        return ev.result
+
+    async def run_digit(text):
+        ev = FakeEvent(text, umo=UMO)
+        async for _chunk in plugin.on_quick_digit_reply(ev):
+            pass
+        return ev.result
+
+    banner("→ /菜单（出菜单）")
+    print(await run_cmd("/菜单"))
+
+    banner("→ 回 1（查电费余额）")
+    print(await run_digit("1"))
+
+    banner("→ 回 2（电费历史）")
+    print(await run_digit("2"))
+
+    banner("→ 回 3（电费自检）")
+    print(await run_digit("3"))
+
+    banner("→ 回 9（越界：没有这个选项）")
+    print(await run_digit("9"))
+
+    banner("→ 回 481526（6 位确认码：菜单不接管）")
+    print(repr(await run_digit("481526")))
+
+    banner("→ 回 0（取消菜单）")
+    print(await run_digit("0"))
+
+    banner("→ 取消后再回 1（不再接管）")
+    print(repr(await run_digit("1")))
+
+
 # ================= 入口 =================
 
 
@@ -303,6 +377,7 @@ async def main(modules):
         "electric": electric_main,
         "games": games_main,
         "memo": memo_main,
+        "quick": quick_main,
     }
     try:
         for name, runner in runners.items():

@@ -16,6 +16,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -318,6 +319,21 @@ class MemoCore:
             return f"没找到本会话的 #{memo_id}。用 /备忘 列表 对一下编号。"
         self.store.save()
         return f"🗑 已删除：{item.get('text', '')}"
+
+    # ================= 快捷数字菜单 =================
+
+    def quick_actions(self) -> list[tuple[str, Any]]:
+        """本模块供快捷数字菜单使用的条目：[(标题, 执行器)]。
+
+        执行器签名 async (event) -> str，返回给用户看的文本。套件根
+        main.py 按模块开关过滤后交给 quick 模块布防编号。
+        """
+        return [("备忘列表", self._quick_list)]
+
+    async def _quick_list(self, event: AstrMessageEvent) -> str:
+        if self.store is None:
+            return "备忘录还没初始化完成，请稍后再试。"
+        return self._list_memo(event.unified_msg_origin)
 
     # ================= LLM 工具本体（装饰器在套件根 main.py） =================
 
